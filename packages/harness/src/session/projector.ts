@@ -177,6 +177,11 @@ export const layer = Layer.effectDiscard(
 				});
 			}),
 		);
+
+		// TODO:
+		// handle event: ToolFailed which modifies based on message ID for type assistant
+		// must iterate over tool call parts and then modify based on session entry and aikit format
+		// make use of context codec if required.
 	}),
 );
 

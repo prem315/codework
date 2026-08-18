@@ -1,8 +1,8 @@
 import { Schema } from "effect";
 import { DateTimeUtcFromMillis, NonNegativeInt, optional } from "../../schema.ts";
+import { SessionMessageSchema } from "../message/schema.ts";
 import { Delivery, Prompt } from "../prompt/schema.ts";
 import { SessionSchema } from "../schema.ts";
-import { SessionMessageSchema } from "../message/schema.ts";
 
 export const Admitted = Schema.Struct({
 	admittedSeq: NonNegativeInt,

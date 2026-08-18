@@ -21,6 +21,12 @@ export const layer = Layer.effect(
 			if (Option.isNone(found)) return yield* new Session.SessionNotFoundError({ sessionId });
 			return yield* assemblePath(sessionId, yield* sessions.path(sessionId));
 		});
+		// TODO:
+		// add method that gives us the latest leaf entry
+		// it's already attached to session
+		// call it `currentLeaf` - this must be in user message or assistant message format.
+		// if its not user message or assistant message; then our assumption is wrong and requires fixing.
+		// session leaf entry must be either assistant or user message.
 		return Service.of({ assemble });
 	}),
 );

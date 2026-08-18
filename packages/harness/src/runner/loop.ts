@@ -42,6 +42,35 @@ export const layer = (options: Options = {}) =>
 			const model = options.model ?? defaults.model;
 			const requestLLM = options.request ?? LLM.run;
 
+			// TODO:
+			// add failInterruptedTools definition
+			// which will pull from context service: currentLeaf
+			// if currentLeaf is type user message then return; do nothing
+			// if currentLeaf is type assistant message then iterate over its
+			// parts.
+			// check if the parts are of tool call, then trigger event for each tool call entry
+			// yield* events.publish(SessionEvent.Tool.Failed, {
+			// see opencode ref: packages/core/src/session/runner/llm.ts Lines:119-139
+			// TODO:
+			// requires projection to handle:ToolFailed event in :packages/harness/src/session/projector.ts
+
+			// TODO:
+			// have runTurnAttempt; take cues form opencode
+
+			// Note: Call Stack: like opencode
+			// run
+			// 	runTurn
+			//			runTurnAttempt
+			//
+			// Division of labour:
+			//   run             - lanes, promotion, failInterruptedTools. Publishes nothing.
+			//   runTurn         - TurnStarted -> runTurnAttempt -> TurnEnded.
+			//                     Also the retry seam (opencode wraps runTurnAttempt here to
+			//                     re-run a turn after overflow compaction: llm.ts:355-381).
+			//   runTurnAttempt  - the turn body: promote input, assemble Context, resolve
+			//                     provider/model, one provider step, then the tool batch.
+			//                     Returns needsContinuation.
+
 			const runTurn = Effect.fn("Loop.runTurn")(function* (
 				sessionId: SessionSchema.ID,
 				promotion: "steer" | "followUp" | undefined,
@@ -98,38 +127,52 @@ export const layer = (options: Options = {}) =>
 				readonly sessionId: SessionSchema.ID;
 				readonly force: boolean;
 			}) {
-				yield* Effect.logInfo("loop: run start").pipe(
-					Effect.annotateLogs({
-						sessionId: input.sessionId,
-						force: input.force,
-					}),
-				);
-
+				// check enqued steering or followUp messages
+				// steer always moves ahead
 				const hasSteer = yield* inputs.hasPending(input.sessionId, "steer");
 				const hasFollowUp = hasSteer ? false : yield* inputs.hasPending(input.sessionId, "followUp");
-				if (!input.force && !hasSteer && !hasFollowUp) {
-					yield* Effect.logInfo("loop: nothing eligible, idling").pipe(
-						Effect.annotateLogs({ sessionId: input.sessionId }),
-					);
-					return;
-				}
+				// if nothing then return
+				// we don't have anything to process
+				if (!input.force && !hasSteer && !hasFollowUp) return;
+				// TODO:
+				// before we continue invoke:
+				// yield* failInterruptedTools(input.sessionID)
+				// this shall use the latest assistant message think arrays last entry
+				// pulls session entry and parts and iterates over them and sets them:
+				// "Tool Execution Interrupted"
+				// - a similar messaging like opencode but formatted for our data model.
 
+				//
+				// promotion that starts the turn
 				let promotion: "steer" | "followUp" | undefined = hasSteer ? "steer" : hasFollowUp ? "followUp" : undefined;
 				let shouldRun = input.force || hasSteer || hasFollowUp;
-				let delivered = 0;
+
 				while (shouldRun) {
 					let needsContinuation = true;
 					while (needsContinuation) {
-						const turn = yield* runTurn(input.sessionId, promotion);
-						delivered += turn.promoted;
-						promotion = "steer";
-						needsContinuation = turn.ran && (yield* inputs.hasPending(input.sessionId, "steer"));
+						// Turn Lifecycle: a turn is one assistant response + any tool calls/results.
+						//
+						// TurnStart/TurnEnd therefore bracket `runTurn` itself, NOT this loop:
+						// every `runTurn` return is a completed turn, which is exactly what
+						// `needsContinuation` reports. Emitting TurnEnd only when the chain stops
+						// would give N starts and one end for an N-round tool chain.
+						const result = yield* runTurn(input.sessionId, promotion);
+						needsContinuation = result.needsContinuation;
+						// check if we its continuation of the same run via `result.needsContinuation`
+						// a continuation is true when we have toolcalls that needs resolving
+						// i.e tools were executed; now we need to feed them back
+						//
+						// else re-run if any steering messages are pending
+						if (!needsContinuation) {
+							needsContinuation = yield* inputs.hasPending(input.sessionId, "steer");
+						}
+						promotion = "steer"; // promotion retains steer within continuation block
 					}
+					//
+					// outside the continuation; check for pending followUp
 					shouldRun = yield* inputs.hasPending(input.sessionId, "followUp");
 					promotion = shouldRun ? "followUp" : undefined;
 				}
-
-				yield* Effect.logInfo("loop: run end").pipe(Effect.annotateLogs({ sessionId: input.sessionId, delivered }));
 			});
 
 			return Runner.Service.of({ run });

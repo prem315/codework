@@ -23,7 +23,6 @@ const PromptFields = {
 	delivery: PromptSchema.Delivery,
 };
 
-// confirmed
 export const PromptAdmitted = EventSchema.define({
 	type: "session.next.prompt.admitted",
 	...durableOptions,
@@ -31,7 +30,6 @@ export const PromptAdmitted = EventSchema.define({
 });
 export type PromptAdmitted = typeof PromptAdmitted.Type;
 
-// confirmed
 export const Prompted = EventSchema.define({
 	type: "session.next.prompt.promoted",
 	...durableOptions,
@@ -39,31 +37,9 @@ export const Prompted = EventSchema.define({
 });
 export type Prompted = typeof Prompted.Type;
 
-/*
- * The aikit response events.
- *
- * Only the two terminals are durable. Every aikit event already carries a
- * complete assistant message, so the terminal one contains everything the
- * response produced -- including whatever was generated before an abort, since
- * aikit reports that as `error` with the accumulated output. Persisting the
- * boundaries in between would buy nothing and cost the invariant: an entry
- * written mid-stream can be left non-terminal by a crash, and `Context.assemble`
- * would then replay a truncated answer to the model as though it were complete.
- *
- * None of these payloads carries aikit's `partial`. It is one mutable object
- * that aikit rewrites in place and pushes by reference into a queue, so by the
- * time a consumer reads a queued event the value has moved on. Only the stable
- * scalars each event computes at push time are safe to carry.
- */
+// working on it
 const LLMFields = {
 	...baseOptions,
-	/*
-	 * aikit's own message id, carried verbatim. `SessionMessageSchema.ID` is
-	 * unprefixed precisely so this needs no translation: the id in the event, the
-	 * id inside the terminal message, and the assistant entry's id are all one
-	 * value, which is what the codec's `entry.id === message.messageId` rule
-	 * wants.
-	 */
 	messageId: SessionMessageSchema.ID,
 };
 
@@ -141,6 +117,14 @@ export const LLMFailed = EventSchema.define({
 	},
 });
 export type LLMFailed = typeof LLMFailed.Type;
+
+// TODO:
+// add support for new event:
+// ToolFailed
+// type: "session.tool.failed"
+// the schema will be similar to what is needed by aikit/session entry
+// e.g will have tool call ID
+// see opencode: .repos/opencode/packages/schema/src/server-event.ts Lines:359-373
 
 /**
  * First event in a forked session's log. The aggregate is the *new* session, so
