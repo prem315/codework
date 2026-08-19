@@ -21,6 +21,22 @@ import { type AnyToolDef, type ModelContent, type RegisteredTool, toAikitTool, t
 /** A complete terminal tool-call part, ready for persistence and event publication. */
 export type ToolOutcome = Message.ToolCallTerminalPart;
 
+/**
+ * What execution needs to run a call: everything aikit's `ToolCallBase` carries,
+ * and no status.
+ *
+ * Status-free is the point. `ToolExecutionStarted` commits `running` *before*
+ * the handler is invoked, so the part the caller holds is already `running` —
+ * taking a `ToolCallPendingPart` here would mean lying about it, and taking a
+ * `ToolCallRunningPart` would mean accepting a `partial` field that is
+ * meaningless as an input.
+ *
+ * Derived from the pending part rather than restated as four fields, so
+ * provider continuity data the base carries — `thoughtSignature`, `namespace` —
+ * survives into the terminal part the outcome spreads it into.
+ */
+export type ExecutionInput = Omit<Message.ToolCallPendingPart, "status">;
+
 /** One progress emission handed to an observer, including the complete running part. */
 export interface ProgressEvent {
 	readonly partial: ToolProgressPartial;
@@ -52,7 +68,7 @@ export interface Executor {
 	/** aikit wire view of the tool set, for the loop context (`convertTools`). */
 	readonly wire: Message.Tool[];
 	/**
-	 * Atomically transform one complete pending tool-call part into a complete terminal
+	 * Atomically transform one complete tool-call input into a complete terminal
 	 * part. Most failures become a terminal
 	 * `ToolOutcome`; a `failureMode: "error"` tool propagates a {@link ToolExecutionError}
 	 * retaining its declared failure as `cause`, and undeclared failures/defects propagate as defects.
@@ -62,7 +78,7 @@ export interface Executor {
 	 * `RProgress`. `options.onProgress` observes live progress off the hot path.
 	 */
 	readonly handle: <RProgress = never, EProgress = never>(
-		call: Message.ToolCallPendingPart,
+		call: ExecutionInput,
 		options?: HandleOptions<RProgress, EProgress>,
 	) => Effect.Effect<ToolOutcome, ToolExecutionError, RProgress>;
 }
@@ -84,52 +100,33 @@ const encodeUnknownJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unkno
 const jsonText = (value: unknown): Effect.Effect<Message.TextContent> =>
 	encodeUnknownJson(value).pipe(Effect.orDie, Effect.map(text));
 
-const endTime = (call: Message.ToolCallPendingPart, now: number) => Math.max(call.time.end, now);
+const endTime = (call: ExecutionInput, now: number) => Math.max(call.time.end, now);
 const result = <IsError extends boolean>(content: ModelContent, isError: IsError, details?: unknown) => ({
 	content: [...content],
 	...(details === undefined ? {} : { details }),
 	isError,
 });
 
-const completed = (
-	call: Message.ToolCallPendingPart,
-	content: ModelContent,
-	now: number,
-	details?: unknown,
-): ToolOutcome => ({
+const completed = (call: ExecutionInput, content: ModelContent, now: number, details?: unknown): ToolOutcome => ({
 	...call,
 	status: "completed",
 	result: result(content, false, details),
 	time: { ...call.time, end: endTime(call, now) },
 });
-const errored = (
-	call: Message.ToolCallPendingPart,
-	content: ModelContent,
-	now: number,
-	details?: unknown,
-): ToolOutcome => ({
+const errored = (call: ExecutionInput, content: ModelContent, now: number, details?: unknown): ToolOutcome => ({
 	...call,
 	status: "error",
 	result: result(content, true, details),
 	time: { ...call.time, end: endTime(call, now) },
 });
-const aborted = (
-	call: Message.ToolCallPendingPart,
-	content: ModelContent,
-	now: number,
-	details?: unknown,
-): ToolOutcome => ({
+const aborted = (call: ExecutionInput, content: ModelContent, now: number, details?: unknown): ToolOutcome => ({
 	...call,
 	status: "aborted",
 	result: result(content, true, details),
 	time: { ...call.time, end: endTime(call, now) },
 });
 
-const running = (
-	call: Message.ToolCallPendingPart,
-	partial: ToolProgressPartial,
-	now: number,
-): Message.ToolCallRunningPart => ({
+const running = (call: ExecutionInput, partial: ToolProgressPartial, now: number): Message.ToolCallRunningPart => ({
 	...call,
 	status: "running",
 	partial: {
@@ -141,7 +138,7 @@ const running = (
 
 const encodeOutcome = (
 	def: AnyToolDef,
-	call: Message.ToolCallPendingPart,
+	call: ExecutionInput,
 	exit: Exit.Exit<unknown, ToolExecutionError>,
 	latest: Ref.Ref<Option.Option<ToolProgressPartial>>,
 ): Effect.Effect<ToolOutcome, ToolExecutionError> =>
@@ -206,96 +203,117 @@ export const make = (tools: ReadonlyArray<RegisteredTool>): Executor => {
 
 	const wire = tools.map((tool) => toAikitTool(tool.definition));
 
+	/**
+	 * Only the handler is interruptible.
+	 *
+	 * `encodeOutcome` turns an interrupted handler into an `aborted` terminal
+	 * carrying the last progress partial — the single most valuable thing this
+	 * pipeline produces under interruption, and the easiest to lose. Every step
+	 * it takes is an interruptible yield point, so with a pending interrupt on
+	 * the fiber it would be built and then dropped. Wrapping only that tail is
+	 * not enough either: entering an uninterruptible region *is* a yield point,
+	 * so the interrupt fires on the way in.
+	 *
+	 * The mask therefore covers the whole pipeline and `restore` re-opens exactly
+	 * one window, around the handler. `Effect.exit` inside that window converts
+	 * the handler's interruption into a value, so control returns to the
+	 * uninterruptible region with an outcome to encode rather than a cause to
+	 * propagate. The caller still owes its own interrupt after this returns.
+	 */
 	const handle = <RProgress = never, EProgress = never>(
-		call: Message.ToolCallPendingPart,
+		call: ExecutionInput,
 		options?: HandleOptions<RProgress, EProgress>,
 	): Effect.Effect<ToolOutcome, ToolExecutionError, RProgress> =>
-		Effect.gen(function* () {
-			const impl = impls.get(call.name);
-			if (impl === undefined) {
-				const now = yield* Effect.clockWith((clock) => clock.currentTimeMillis);
-				return errored(call, [text(`Unknown tool: ${call.name}`)], now, {
-					error: "unknown_tool",
-					name: call.name,
-				});
-			}
-			const def = impl.definition;
+		Effect.uninterruptibleMask((restore) =>
+			Effect.gen(function* () {
+				const impl = impls.get(call.name);
+				if (impl === undefined) {
+					const now = yield* Effect.clockWith((clock) => clock.currentTimeMillis);
+					return errored(call, [text(`Unknown tool: ${call.name}`)], now, {
+						error: "unknown_tool",
+						name: call.name,
+					});
+				}
+				const def = impl.definition;
 
-			const decoded = yield* Effect.result(Schema.decodeEffect(asCodec(def.parameters))(call.arguments));
-			if (Result.isFailure(decoded)) {
-				const now = yield* Effect.clockWith((clock) => clock.currentTimeMillis);
-				return errored(call, [text(`Invalid arguments for ${call.name}: ${decoded.failure.message}`)], now, {
-					error: "invalid_arguments",
-					name: call.name,
-				});
-			}
+				const decoded = yield* Effect.result(Schema.decodeEffect(asCodec(def.parameters))(call.arguments));
+				if (Result.isFailure(decoded)) {
+					const now = yield* Effect.clockWith((clock) => clock.currentTimeMillis);
+					return errored(call, [text(`Invalid arguments for ${call.name}: ${decoded.failure.message}`)], now, {
+						error: "invalid_arguments",
+						name: call.name,
+					});
+				}
 
-			const ctx: ToolCallContext = { callID: call.callID, toolName: call.name, rawArgs: call.arguments };
+				const ctx: ToolCallContext = { callID: call.callID, toolName: call.name, rawArgs: call.arguments };
 
-			// Latest partial: captured for aborted-call output regardless of any sink.
-			const latest = yield* Ref.make(Option.none<ToolProgressPartial>());
-			// True while an onProgress write is in flight, so "drained" means the queue is empty
-			// AND the last sink write finished — not merely dequeued.
-			const activeProgress = yield* Ref.make(false);
+				// Latest partial: captured for aborted-call output regardless of any sink.
+				const latest = yield* Ref.make(Option.none<ToolProgressPartial>());
+				// True while an onProgress write is in flight, so "drained" means the queue is empty
+				// AND the last sink write finished — not merely dequeued.
+				const activeProgress = yield* Ref.make(false);
 
-			const onProgress = options?.onProgress;
-			const progressQueue = onProgress
-				? yield* Queue.sliding<ProgressEvent>(options?.progressBuffer ?? DEFAULT_PROGRESS_BUFFER)
-				: undefined;
+				const onProgress = options?.onProgress;
+				const progressQueue = onProgress
+					? yield* Queue.sliding<ProgressEvent>(options?.progressBuffer ?? DEFAULT_PROGRESS_BUFFER)
+					: undefined;
 
-			// Best-effort delivery off the hot path: swallow (log-drop) sink failures, never fail the
-			// tool. This is the only place onProgress runs, so its RProgress/error live here. Typed
-			// explicitly so `RProgress` is pinned through `Effect.gen`'s requirement inference.
-			const forkDrain: Effect.Effect<void, never, RProgress | Scope.Scope> =
-				progressQueue && onProgress
-					? Queue.take(progressQueue).pipe(
-							Effect.flatMap((event) =>
-								Ref.set(activeProgress, true).pipe(
-									Effect.andThen(onProgress(event).pipe(Effect.ignore)),
-									Effect.ensuring(Ref.set(activeProgress, false)),
+				// Best-effort delivery off the hot path: swallow (log-drop) sink failures, never fail the
+				// tool. This is the only place onProgress runs, so its RProgress/error live here. Typed
+				// explicitly so `RProgress` is pinned through `Effect.gen`'s requirement inference.
+				const forkDrain: Effect.Effect<void, never, RProgress | Scope.Scope> =
+					progressQueue && onProgress
+						? Queue.take(progressQueue).pipe(
+								Effect.flatMap((event) =>
+									Ref.set(activeProgress, true).pipe(
+										Effect.andThen(onProgress(event).pipe(Effect.ignore)),
+										Effect.ensuring(Ref.set(activeProgress, false)),
+									),
 								),
-							),
-							Effect.forever,
-							Effect.forkScoped,
-							Effect.asVoid,
-						)
-					: Effect.void;
-			yield* forkDrain;
+								Effect.forever,
+								Effect.forkScoped,
+								Effect.asVoid,
+							)
+						: Effect.void;
+				yield* forkDrain;
 
-			// report is fast + infallible: set latest, then a non-blocking offer (sliding drops the
-			// oldest when full). No sink latency reaches the tool.
-			const report = Effect.fn("ToolExecutor.reportProgress")(function* (partial: ToolProgressPartial) {
-				yield* Ref.set(latest, Option.some(partial));
-				if (progressQueue === undefined) return;
-				const now = yield* Effect.clockWith((clock) => clock.currentTimeMillis);
-				yield* Queue.offer(progressQueue, { partial, toolCall: running(call, partial, now), ctx });
-			});
-			const progress = ToolProgress.of({ report });
-
-			// The handler keeps its OWN inner scope, so its resources release the moment it finishes
-			// — not after the drain grace (which is bounded by the outer `Effect.scoped` below).
-			const exit = yield* impl
-				.handler(decoded.success, ctx)
-				.pipe(Effect.scoped, Effect.provideService(ToolProgress, progress), Effect.exit);
-
-			// Graceful bounded drain on NORMAL completion: wait until the queue is empty AND no sink
-			// write is in flight, bounded by progressDrainGrace. Skipped on interruption (snappy abort).
-			const interrupted = Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause);
-			if (progressQueue && !interrupted) {
-				const drained = Effect.gen(function* () {
-					const size = yield* Queue.size(progressQueue);
-					const active = yield* Ref.get(activeProgress);
-					return size === 0 && !active;
+				// report is fast + infallible: set latest, then a non-blocking offer (sliding drops the
+				// oldest when full). No sink latency reaches the tool.
+				const report = Effect.fn("ToolExecutor.reportProgress")(function* (partial: ToolProgressPartial) {
+					yield* Ref.set(latest, Option.some(partial));
+					if (progressQueue === undefined) return;
+					const now = yield* Effect.clockWith((clock) => clock.currentTimeMillis);
+					yield* Queue.offer(progressQueue, { partial, toolCall: running(call, partial, now), ctx });
 				});
-				yield* drained.pipe(
-					Effect.repeat({ schedule: Schedule.spaced(DRAIN_POLL), until: (done) => done }),
-					Effect.timeout(options?.progressDrainGrace ?? DEFAULT_DRAIN_GRACE),
-					Effect.ignore,
-				);
-			}
+				const progress = ToolProgress.of({ report });
 
-			return yield* encodeOutcome(def, call, exit, latest);
-		}).pipe(Effect.scoped);
+				// The handler keeps its OWN inner scope, so its resources release the moment it finishes
+				// — not after the drain grace (which is bounded by the outer `Effect.scoped` below).
+				const exit = yield* restore(
+					impl
+						.handler(decoded.success, ctx)
+						.pipe(Effect.scoped, Effect.provideService(ToolProgress, progress), Effect.exit),
+				);
+
+				// Graceful bounded drain on NORMAL completion: wait until the queue is empty AND no sink
+				// write is in flight, bounded by progressDrainGrace. Skipped on interruption (snappy abort).
+				const interrupted = Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause);
+				if (progressQueue && !interrupted) {
+					const drained = Effect.gen(function* () {
+						const size = yield* Queue.size(progressQueue);
+						const active = yield* Ref.get(activeProgress);
+						return size === 0 && !active;
+					});
+					yield* drained.pipe(
+						Effect.repeat({ schedule: Schedule.spaced(DRAIN_POLL), until: (done) => done }),
+						Effect.timeout(options?.progressDrainGrace ?? DEFAULT_DRAIN_GRACE),
+						Effect.ignore,
+					);
+				}
+
+				return yield* encodeOutcome(def, call, exit, latest);
+			}).pipe(Effect.scoped),
+		);
 
 	return { wire, handle };
 };

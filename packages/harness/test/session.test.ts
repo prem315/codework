@@ -326,8 +326,10 @@ const liveToolConversation = <TProtocol extends Protocol.ProtocolWithOptions>(
 			},
 		};
 		yield* session.settleToolCall({
+			sessionId: created.id,
 			entryId: toolRequest.messageId,
 			callId: toolCall.callID,
+			toolName: toolCall.name,
 			status: "completed",
 			data: JSON.stringify(completedToolCall),
 		});
@@ -529,8 +531,10 @@ describe("session", () => {
 			expect(Option.getOrElse(pending[0]!.callId, () => "")).toBe("call_1");
 
 			yield* session.settleToolCall({
+				sessionId: created.id,
 				entryId: "e2",
 				callId: "call_1",
+				toolName: "read",
 				status: "completed",
 				data: JSON.stringify({
 					type: "toolCall",
@@ -555,6 +559,87 @@ describe("session", () => {
 		}),
 	);
 
+	it.effect("settleToolCall rejects a transition out of a state the call has left", () =>
+		Effect.gen(function* () {
+			const session = yield* Session.Service;
+			const created = yield* createSession("s-settle-conflict");
+			yield* session.append(userEntry(created.id, "e1", "hi"));
+			yield* session.append(assistantEntry(created.id, "e2", { toolCall: { callId: "call_1", toolName: "read" } }));
+
+			const settle = (status: "completed" | "error", text: string) =>
+				session.settleToolCall({
+					sessionId: created.id,
+					entryId: "e2",
+					callId: "call_1",
+					toolName: "read",
+					status,
+					data: JSON.stringify({
+						type: "toolCall",
+						callID: "call_1",
+						name: "read",
+						status,
+						result: { content: [{ type: "text", text }], isError: status === "error" },
+					}),
+				});
+
+			yield* settle("completed", "first");
+
+			// Replaying the identical write is how idempotence looks — a durable
+			// event can be projected more than once.
+			yield* settle("completed", "first");
+
+			// A different value over a settled call is not. Letting it through would
+			// make the terminal a matter of arrival order.
+			const conflict = yield* settle("error", "second").pipe(Effect.flip);
+			expect(conflict._tag).toBe("ToolCallConflictError");
+			if (conflict._tag !== "ToolCallConflictError") return;
+			expect(conflict.reason).toContain("cannot move to");
+
+			// And the rejected write changed nothing.
+			const entry = Option.getOrThrow(yield* session.entry("e2"));
+			const stored = entry.parts.find((part) => part.type === "toolCall");
+			expect(JSON.parse(stored!.data).result.content[0].text).toBe("first");
+		}),
+	);
+
+	it.effect("settleToolCall rejects a call that belongs to another session or another tool", () =>
+		Effect.gen(function* () {
+			const session = yield* Session.Service;
+			const created = yield* createSession("s-settle-ownership");
+			const other = yield* createSession("s-settle-ownership-other");
+			yield* session.append(userEntry(created.id, "e1", "hi"));
+			yield* session.append(assistantEntry(created.id, "e2", { toolCall: { callId: "call_1", toolName: "read" } }));
+
+			const settle = (sessionId: typeof created.id, toolName: string) =>
+				session.settleToolCall({
+					sessionId,
+					entryId: "e2",
+					callId: "call_1",
+					toolName,
+					status: "completed",
+					data: JSON.stringify({
+						type: "toolCall",
+						callID: "call_1",
+						name: toolName,
+						status: "completed",
+						result: { content: [{ type: "text", text: "x" }], isError: false },
+					}),
+				});
+
+			const foreign = yield* settle(other.id, "read").pipe(Effect.flip);
+			expect(foreign._tag).toBe("ToolCallConflictError");
+			if (foreign._tag === "ToolCallConflictError") expect(foreign.reason).toContain("belongs to session");
+
+			// Continuity: a mismatch means two different calls are being treated as
+			// one, which no amount of matching ids makes safe.
+			const renamed = yield* settle(created.id, "write").pipe(Effect.flip);
+			expect(renamed._tag).toBe("ToolCallConflictError");
+			if (renamed._tag === "ToolCallConflictError") expect(renamed.reason).toContain("finalized as");
+
+			expect(yield* session.unsettled(created.id)).toHaveLength(1);
+		}),
+	);
+
 	it.effect("settleToolCall on an unknown call fails typed", () =>
 		Effect.gen(function* () {
 			const session = yield* Session.Service;
@@ -562,7 +647,14 @@ describe("session", () => {
 			yield* session.append(userEntry(created.id, "e1", "hi"));
 
 			const result = yield* session
-				.settleToolCall({ entryId: "e1", callId: "call_x", status: "error", data: "{}" })
+				.settleToolCall({
+					sessionId: created.id,
+					entryId: "e1",
+					callId: "call_x",
+					toolName: "read",
+					status: "error",
+					data: "{}",
+				})
 				.pipe(Effect.flip);
 			expect(result._tag).toBe("ToolCallNotFoundError");
 		}),

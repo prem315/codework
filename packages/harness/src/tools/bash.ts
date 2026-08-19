@@ -66,11 +66,25 @@ type BashFailureError = BashFailed | BashTimedOut;
 export const bashDef = Tool.define({
 	name: "bash",
 	label: "bash",
-	promptSnippet: "Execute bash commands (ls, grep, find, etc.).",
+	// The one-line index entry. Deliberately says what the tool *is*, not how to
+	// call it -- call-time semantics live in `description`, which the provider
+	// caches alongside the parameter schema.
+	promptSnippet: "Run a shell command in the working directory.",
 	description:
 		"Execute a bash command in the working directory and return its combined stdout/stderr output. " +
 		`Output is truncated to the last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES}KB (whichever is hit first); when truncated, the full ` +
 		"output is saved to a temp file. A non-zero exit code is reported as an error carrying the captured output.",
+	/*
+	 * Cross-cutting advice, not call-time semantics. Bash is the only built-in
+	 * tool in this phase, so it is also the only way to inspect the filesystem --
+	 * saying so belongs in the shared guidelines rather than buried in this
+	 * tool's own description, and it stops being true the moment a read or grep
+	 * tool is registered alongside it.
+	 */
+	promptGuidelines: [
+		"Use bash for filesystem work: listing, searching, and reading files.",
+		"Prefer one command that answers the question over several exploratory ones.",
+	],
 	parameters: BashParams,
 	success: BashSuccess,
 	failure: BashFailure,

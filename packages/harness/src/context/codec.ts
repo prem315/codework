@@ -4,7 +4,12 @@
  * */
 import { Message } from "@codeworksh/aikit";
 import { DateTime, Effect, Option, Schema } from "effect";
-import { validateAikitMessage, validateAikitUserMessage } from "../schema.ts";
+import {
+	validateAikitMessage,
+	validateAikitPendingToolCall,
+	validateAikitToolCall,
+	validateAikitUserMessage,
+} from "../schema.ts";
 import { SessionSchema } from "../session/schema.ts";
 import type { Session } from "../session/session.ts";
 import { ContextDecodeError, ContextEncodeError } from "./errors.ts";
@@ -51,6 +56,31 @@ export const validateUserMessage = (
 		catch: (cause) => new ContextDecodeError({ entryId, type, reason: reasonOf(cause) }),
 	});
 
+type AnyPart = Message.Message["parts"][number];
+
+/**
+ * One part as a storable row: verbatim JSON plus the columns promoted out of it.
+ *
+ * The promotion is not a convenience copy — `status`, `callId`, and `toolName`
+ * are indexed, and `decodeParts` re-checks them against the JSON on the way
+ * back, so they have to be derived here rather than restated by each caller.
+ */
+export const encodePart = Effect.fn("Context.encodePart")(function* (input: {
+	readonly messageId: string;
+	readonly role: "user" | "assistant";
+	readonly part: AnyPart;
+}): Effect.fn.Return<Session.AppendPart, ContextEncodeError> {
+	const { messageId, role, part } = input;
+	const data = yield* encodeJsonObject(part).pipe(
+		Effect.mapError((cause) => new ContextEncodeError({ messageId, role, reason: cause.message })),
+	);
+	return {
+		type: part.type,
+		...(part.type === "toolCall" ? { status: part.status, callId: part.callID, toolName: part.name } : {}),
+		data,
+	};
+});
+
 export const encodeMessage = Effect.fn("Context.encodeMessage")(function* (
 	message: Message.Message,
 ): Effect.fn.Return<EncodedMessage, ContextEncodeError> {
@@ -75,21 +105,7 @@ export const encodeMessage = Effect.fn("Context.encodeMessage")(function* (
 		),
 	);
 	const encodedParts = yield* Effect.forEach(parts, (part) =>
-		encodeJsonObject(part).pipe(
-			Effect.map((data) => ({
-				type: part.type,
-				...(part.type === "toolCall" ? { status: part.status, callId: part.callID, toolName: part.name } : {}),
-				data,
-			})),
-			Effect.mapError(
-				(cause) =>
-					new ContextEncodeError({
-						messageId: message.messageId,
-						role: message.role,
-						reason: cause.message,
-					}),
-			),
-		),
+		encodePart({ messageId: validated.messageId, role: validated.role, part }),
 	);
 	return {
 		type: validated.role,
@@ -112,13 +128,24 @@ const decodeParts = Effect.fn("Context.decodeParts")(function* (
 				reason: `part ${index} belongs to entry ${row.entryId}`,
 			});
 		}
-		if (row.partIndex !== index) {
-			return yield* new ContextDecodeError({
-				entryId: entry.id,
-				type: entry.type,
-				reason: `part indexes must be dense from 0; expected ${index}, received ${row.partIndex}`,
-			});
-		}
+		/*
+		 * Gaps are legal, and this used to reject them.
+		 *
+		 * `partIndex` is aikit's own addressing — a block's position in the message
+		 * it is being assembled into — and a slot is written when its block
+		 * completes, not when it is announced. So an entry killed mid-stream can
+		 * genuinely hold part 1 and not part 0: the text block at 0 was announced
+		 * and never finished while the tool call at 1 finalized. Requiring dense
+		 * indexes made that entry unreadable, which broke `latestAssistant` and
+		 * `assemble` on precisely the entry the recovery sweep exists to settle —
+		 * and, because both are read on every drain, left the session permanently
+		 * undrainable.
+		 *
+		 * Nothing is lost by allowing it. A settled assistant is dense by
+		 * construction rather than by inspection: `finalizeAssistant` upserts the
+		 * terminal's whole array and deletes anything past its end. This check only
+		 * ever fired on entries still in flight.
+		 */
 		const part = yield* parseJson(row.data, entry.id, entry.type, `part ${index}`);
 		if (typeof part !== "object" || part === null || !("type" in part) || part.type !== row.type) {
 			return yield* new ContextDecodeError({
@@ -155,6 +182,52 @@ const decodeParts = Effect.fn("Context.decodeParts")(function* (
 		parts.push(part);
 	}
 	return parts;
+});
+
+/**
+ * One stored `toolCall` row, back as the value the executor takes.
+ *
+ * The loop re-reads what it committed rather than trusting the terminal message
+ * it holds in memory, so this is the boundary that turns a row back into an
+ * aikit part. The status is dropped, not checked: `ExecutionInput` is
+ * status-free because `ToolExecutionStarted` commits `running` before the
+ * handler runs.
+ */
+export const decodeToolCall = Effect.fn("Context.decodeToolCall")(function* (row: {
+	readonly entryId: string;
+	readonly partIndex: number;
+	readonly data: string;
+}): Effect.fn.Return<Message.ToolCallPendingPart, ContextDecodeError> {
+	const part = yield* parseJson(row.data, row.entryId, "assistant", `part ${row.partIndex}`);
+	return yield* Effect.try({
+		try: () => validateAikitPendingToolCall(part, `context entry ${row.entryId} part ${row.partIndex}`),
+		catch: (cause) => new ContextDecodeError({ entryId: row.entryId, type: "assistant", reason: reasonOf(cause) }),
+	});
+});
+
+/**
+ * Any stored `toolCall` row as its identity and arguments, without its outcome.
+ *
+ * What recovery needs: a call it must settle may be `pending` or `running`, and
+ * neither status nor a running `partial` belongs in the terminal part
+ * synthesized from it. The result is the same status-free shape execution takes.
+ */
+export const decodeToolCallBase = Effect.fn("Context.decodeToolCallBase")(function* (row: {
+	readonly entryId: string;
+	readonly partIndex: number;
+	readonly data: string;
+}): Effect.fn.Return<Omit<Message.ToolCallPendingPart, "status">, ContextDecodeError> {
+	const parsed = yield* parseJson(row.data, row.entryId, "assistant", `part ${row.partIndex}`);
+	const call = yield* Effect.try({
+		try: () => validateAikitToolCall(parsed, `context entry ${row.entryId} part ${row.partIndex}`),
+		catch: (cause) => new ContextDecodeError({ entryId: row.entryId, type: "assistant", reason: reasonOf(cause) }),
+	});
+	const { status: _status, ...base } = call;
+	return "partial" in base || "result" in base
+		? (({ partial: _partial, result: _result, ...rest }) => rest)(
+				base as typeof base & { partial?: unknown; result?: unknown },
+			)
+		: base;
 });
 
 export const decodeSyntheticMessage = Effect.fn("Context.decodeSyntheticMessage")(function* (

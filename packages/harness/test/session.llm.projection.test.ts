@@ -1,5 +1,5 @@
 import type { Message } from "@codeworksh/aikit";
-import { DateTime, Effect, Layer } from "effect";
+import { DateTime, Effect, Exit, Layer, Option } from "effect";
 import { SqlClient } from "effect/unstable/sql";
 import { describe, expect } from "vite-plus/test";
 import { Database } from "../src/db/db.ts";
@@ -9,11 +9,12 @@ import { SandboxInstance } from "../src/sandbox/instance.ts";
 import { AbsolutePath } from "../src/schema.ts";
 import { SessionLive } from "../src/session/live.ts";
 import { SessionMessageSchema } from "../src/session/message/schema.ts";
+import type { SessionSchema } from "../src/session/schema.ts";
 import { Session } from "../src/session/session.ts";
 import { testEffect } from "./utils/effect.ts";
 
 /**
- * The output half on its own: publish the terminal aikit events and assert what
+ * The output half on its own: publish the durable LLM events and assert what
  * reaches `session_entry`. No loop, no publisher, no provider — the whole point
  * of splitting the phases is that this side is provable without them.
  */
@@ -58,6 +59,35 @@ const assistant = (overrides: Partial<Message.AssistantMessage> = {}): Message.A
 	...overrides,
 });
 
+/**
+ * The envelope `LLMStarted` creates the entry from: identity and provenance,
+ * no content, no usage, `stopReason: "aborted"` until a terminal promotes it.
+ */
+const creation = (): Message.AssistantMessage =>
+	assistant({
+		parts: [],
+		stopReason: "aborted",
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+	});
+
+/** Allocate the entry, the way every response now begins. */
+const start = Effect.fnUntraced(function* (sessionId: SessionSchema.ID) {
+	const events = yield* Event.Service;
+	return yield* events.publish(EventList.LLMStarted, {
+		sessionId,
+		messageId,
+		timestamp: DateTime.makeUnsafe(0),
+		message: creation(),
+	});
+});
+
 const usageTotals = Effect.gen(function* () {
 	const sql = yield* SqlClient.SqlClient;
 	// The client is configured with `transformResultNames: snakeToCamel`, so the
@@ -72,18 +102,10 @@ const eventCount = Effect.gen(function* () {
 });
 
 describe("LLM terminal projection", () => {
-	it("appends one assistant entry from session.llm.ended", () =>
+	it("creates the entry at session.llm.started, empty and aborted", () =>
 		Effect.gen(function* () {
-			const { sessions, events, sessionId } = yield* setup;
-			const message = assistant();
-
-			const published = yield* events.publish(EventList.LLMEnded, {
-				sessionId,
-				messageId,
-				timestamp: DateTime.makeUnsafe(0),
-				reason: "stop",
-				message,
-			});
+			const { sessions, sessionId } = yield* setup;
+			const published = yield* start(sessionId);
 
 			const path = yield* sessions.path(sessionId);
 			expect(path.length).toBe(1);
@@ -93,16 +115,206 @@ describe("LLM terminal projection", () => {
 			expect(entry!.entry.id).toBe(messageId);
 			expect(entry!.entry.type).toBe("assistant");
 			expect(entry!.entry.seq).toBe(published.durable?.seq);
+			// The empty array the block completions fill, marked so a crash here
+			// leaves a truthful record rather than a response that looks finished.
+			expect(entry!.parts).toEqual([]);
+			expect(JSON.parse(entry!.entry.data)).toMatchObject({ stopReason: "aborted" });
+			expect((yield* usageTotals).tokensInput).toBe(0);
+		}));
 
-			// Parts are split out of the envelope and stored dense, in order.
+	it("writes a completed block at its partIndex, before any terminal", () =>
+		Effect.gen(function* () {
+			const { sessions, events, sessionId } = yield* setup;
+			yield* start(sessionId);
+
+			yield* events.publish(EventList.LLMThinkingEnd, {
+				sessionId,
+				messageId,
+				timestamp: DateTime.makeUnsafe(0),
+				partIndex: 0,
+				// The signature rides along: it is what a provider needs to continue
+				// this reasoning thread on the next turn.
+				part: { type: "thinking", thinking: "hmm", thinkingSignature: "sig" },
+			});
+			yield* events.publish(EventList.LLMTextEnd, {
+				sessionId,
+				messageId,
+				timestamp: DateTime.makeUnsafe(0),
+				partIndex: 1,
+				part: { type: "text", text: "the answer" },
+			});
+
+			const [entry] = yield* sessions.path(sessionId);
+			expect(entry!.parts.map((part) => part.type)).toEqual(["thinking", "text"]);
+			expect(JSON.parse(entry!.parts[0]!.data)).toEqual({
+				type: "thinking",
+				thinking: "hmm",
+				thinkingSignature: "sig",
+			});
+			// Still aborted: a block completing is not a response settling.
+			expect(JSON.parse(entry!.entry.data)).toMatchObject({ stopReason: "aborted" });
+		}));
+
+	it("writes a finalized tool call as a pending part with its columns promoted", () =>
+		Effect.gen(function* () {
+			const { sessions, events, sessionId } = yield* setup;
+			yield* start(sessionId);
+			const part = {
+				type: "toolCall",
+				callID: "call_1",
+				name: "bash",
+				arguments: { command: "pwd" },
+				status: "pending",
+				time: { start: 1, end: 2 },
+			} as const satisfies Message.ToolCallPendingPart;
+
+			yield* events.publish(EventList.LLMToolCallFinalized, {
+				sessionId,
+				messageId,
+				timestamp: DateTime.makeUnsafe(0),
+				partIndex: 0,
+				callId: part.callID,
+				toolName: part.name,
+				part,
+			});
+
+			const [entry] = yield* sessions.path(sessionId);
+			expect(JSON.parse(entry!.parts[0]!.data)).toEqual(part);
+			// `pending` is the whole point: the model finished asking, and the
+			// transition into `running` belongs to ToolExecutionStarted alone.
+			expect(Option.getOrNull(entry!.parts[0]!.status)).toBe("pending");
+			expect(Option.getOrNull(entry!.parts[0]!.callId)).toBe("call_1");
+			expect(Option.getOrNull(entry!.parts[0]!.toolName)).toBe("bash");
+			expect(JSON.parse(entry!.entry.data)).toMatchObject({ stopReason: "aborted" });
+		}));
+
+	it("promotes the entry at session.llm.ended and reconciles its parts", () =>
+		Effect.gen(function* () {
+			const { sessions, events, sessionId } = yield* setup;
+			yield* start(sessionId);
+			yield* events.publish(EventList.LLMTextEnd, {
+				sessionId,
+				messageId,
+				timestamp: DateTime.makeUnsafe(0),
+				partIndex: 0,
+				part: { type: "text", text: "the ans" },
+			});
+
+			yield* events.publish(EventList.LLMEnded, {
+				sessionId,
+				messageId,
+				timestamp: DateTime.makeUnsafe(0),
+				reason: "stop",
+				message: assistant(),
+			});
+
+			const path = yield* sessions.path(sessionId);
+			expect(path.length).toBe(1);
+			const [entry] = path;
+			// One entry, promoted in place — the terminal does not append a second.
+			expect(entry!.entry.id).toBe(messageId);
 			expect(entry!.parts.map((part) => part.type)).toEqual(["text"]);
+			// The terminal is authoritative, so it overwrites the slot the block
+			// completion filled rather than landing beside it.
 			expect(JSON.parse(entry!.parts[0]!.data)).toEqual({ type: "text", text: "the answer" });
 			expect(JSON.parse(entry!.entry.data)).toMatchObject({ role: "assistant", stopReason: "stop" });
+		}));
+
+	it("rejects a terminal whose message disagrees with its own reason", () =>
+		Effect.gen(function* () {
+			const { sessions, events, sessionId } = yield* setup;
+			yield* start(sessionId);
+
+			// The event says how the stream ended and the message says how it ended.
+			// A disagreement means the publisher and aikit no longer describe the
+			// same response, and the envelope about to be written is the one that
+			// would be believed forever after.
+			const exit = yield* events
+				.publish(EventList.LLMEnded, {
+					sessionId,
+					messageId,
+					timestamp: DateTime.makeUnsafe(0),
+					reason: "toolUse",
+					message: assistant({ stopReason: "stop" }),
+				})
+				.pipe(Effect.exit);
+			expect(Exit.isFailure(exit)).toBe(true);
+
+			// And the rejection took the durable event down with it: the entry is
+			// still the unfinalized placeholder.
+			const [entry] = yield* sessions.path(sessionId);
+			expect(JSON.parse(entry!.entry.data)).toMatchObject({ stopReason: "aborted" });
+		}));
+
+	it("charges usage once even when the same aborted terminal is delivered twice", () =>
+		Effect.gen(function* () {
+			const { events, sessionId } = yield* setup;
+			yield* start(sessionId);
+			const failed = assistant({ stopReason: "aborted", errorMessage: "interrupted" });
+
+			yield* events.publish(EventList.LLMFailed, {
+				sessionId,
+				messageId,
+				timestamp: DateTime.makeUnsafe(0),
+				reason: "aborted",
+				message: failed,
+			});
+			const charged = yield* usageTotals;
+
+			/*
+			 * An aborted terminal writes the same `stopReason` the placeholder holds,
+			 * so finality cannot be inferred from it. Redelivery is most likely on
+			 * exactly this path, which is where a double charge would land.
+			 */
+			yield* events.publish(EventList.LLMFailed, {
+				sessionId,
+				messageId,
+				timestamp: DateTime.makeUnsafe(1),
+				reason: "aborted",
+				message: failed,
+			});
+
+			expect(yield* usageTotals).toEqual(charged);
+		}));
+
+	it("absorbs an identical redelivery and rejects a different second terminal", () =>
+		Effect.gen(function* () {
+			const { sessions, events, sessionId } = yield* setup;
+			yield* start(sessionId);
+			const terminal = {
+				sessionId,
+				messageId,
+				timestamp: DateTime.makeUnsafe(0),
+				reason: "stop",
+				message: assistant(),
+			} as const;
+			yield* events.publish(EventList.LLMEnded, terminal);
+
+			// The same value arriving twice is a re-projection, not a rewrite — the
+			// same rule tool-call settlement follows.
+			yield* events.publish(EventList.LLMEnded, { ...terminal, timestamp: DateTime.makeUnsafe(1) });
+			expect((yield* usageTotals).tokensInput).toBe(11);
+			expect((yield* sessions.path(sessionId)).length).toBe(1);
+
+			// A *different* envelope over a final one is not. This is what the
+			// immutability rule is actually protecting.
+			const conflicting = yield* events
+				.publish(EventList.LLMEnded, {
+					...terminal,
+					timestamp: DateTime.makeUnsafe(2),
+					reason: "length",
+					message: assistant({ stopReason: "length" }),
+				})
+				.pipe(Effect.exit);
+			expect(conflicting._tag).toBe("Failure");
+			expect(JSON.parse((yield* sessions.path(sessionId))[0]!.entry.data)).toMatchObject({ stopReason: "stop" });
+			expect((yield* usageTotals).tokensInput).toBe(11);
 		}));
 
 	it("stores a failed response the same way, keeping what the model produced", () =>
 		Effect.gen(function* () {
 			const { sessions, events, sessionId } = yield* setup;
+			yield* start(sessionId);
 
 			yield* events.publish(EventList.LLMFailed, {
 				sessionId,
@@ -130,6 +342,8 @@ describe("LLM terminal projection", () => {
 	it("charges usage once, from the terminal message", () =>
 		Effect.gen(function* () {
 			const { events, sessionId } = yield* setup;
+			// Creation charges nothing; only the terminal carries final usage.
+			yield* start(sessionId);
 			expect((yield* usageTotals).tokensInput).toBe(0);
 
 			yield* events.publish(EventList.LLMEnded, {
@@ -150,6 +364,7 @@ describe("LLM terminal projection", () => {
 	it("rolls back the entry, the event row, and the sequence when the ids disagree", () =>
 		Effect.gen(function* () {
 			const { sessions, events, sessionId } = yield* setup;
+			yield* start(sessionId);
 			const before = yield* events.latestSequence(sessionId);
 
 			// The event names one message, the payload names another. Storing this
@@ -166,9 +381,11 @@ describe("LLM terminal projection", () => {
 
 			expect(failure._tag).toBe("Failure");
 			// A projector runs inside the commit, so its rejection takes the event and
-			// the sequence allocation down with it — not just the entry.
-			expect(yield* sessions.path(sessionId)).toEqual([]);
-			expect(yield* eventCount).toBe(0);
+			// the sequence allocation down with it — the entry stays as `LLMStarted`
+			// left it, unfinalized, and no second event row survives.
+			const [entry] = yield* sessions.path(sessionId);
+			expect(JSON.parse(entry!.entry.data)).toMatchObject({ stopReason: "aborted" });
+			expect(yield* eventCount).toBe(1);
 			expect(yield* events.latestSequence(sessionId)).toBe(before);
 		}));
 
@@ -184,6 +401,7 @@ describe("LLM terminal projection", () => {
 				prompt: { text: "ask" },
 				delivery: "steer",
 			});
+			yield* start(sessionId);
 			yield* events.publish(EventList.LLMEnded, {
 				sessionId,
 				messageId,

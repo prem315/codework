@@ -129,7 +129,7 @@ describe("context codec", () => {
 			expect(failure.reason).toContain("time/created");
 		}));
 
-	it("rejects sparse indexes and mismatched promoted tool columns", () =>
+	it("reads a gap in the indexes, and rejects mismatched promoted tool columns", () =>
 		Effect.gen(function* () {
 			const { appendMessage, sessions, sql } = yield* setup;
 			const original = assistant("a_corrupt", "provider-a", "model-a", [
@@ -145,9 +145,11 @@ describe("context codec", () => {
 			yield* appendMessage(original);
 			yield* sql`UPDATE session_entry_part SET part_index = 1 WHERE entry_id = ${original.messageId}`;
 			const sparse = Option.getOrThrow(yield* sessions.entry(original.messageId));
-			const sparseError = yield* ContextCodec.decodeMessage(sparse).pipe(Effect.flip);
-			expect(sparseError._tag).toBe("ContextDecodeError");
-			expect(sparseError.reason).toContain("dense");
+			// A gap is what an entry killed mid-stream looks like: a block announced
+			// at 0 that never completed, and one at 1 that did. Rejecting it made the
+			// entry unreadable, which broke the sweep that exists to settle it.
+			const decoded = yield* ContextCodec.decodeMessage(sparse);
+			expect(decoded.parts.map((part) => part.type)).toEqual(["toolCall"]);
 
 			yield* sql`
 				UPDATE session_entry_part SET part_index = 0, call_id = 'call_other'

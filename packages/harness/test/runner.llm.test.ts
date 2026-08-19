@@ -29,7 +29,11 @@ const setup = Effect.gen(function* () {
 		tag: "test",
 		sandboxInstanceId: SandboxInstance.ID.local,
 	});
-	return { sessionId: session.id, publisher: yield* LLMEventPublisher.make({ sessionId: session.id }) };
+	return {
+		sessions,
+		sessionId: session.id,
+		publisher: yield* LLMEventPublisher.make({ sessionId: session.id, provider: "openai", model: "gpt-5.5" }),
+	};
 });
 
 const context: Message.Context = {
@@ -46,17 +50,27 @@ describe("runner LLM", () => {
 	it(
 		"maps an unknown model to ModelNotFoundError",
 		Effect.gen(function* () {
-			const { sessionId, publisher } = yield* setup;
+			const { sessions, sessionId, publisher } = yield* setup;
 			const failure = yield* LLM.run({
 				sessionId,
 				context,
 				provider: "openai",
 				model: "model-that-does-not-exist",
+				options: { sessionId },
 				publisher,
 			}).pipe(Effect.flip);
 
 			expect(failure._tag).toBe("Runner.ModelNotFoundError");
 			expect(failure).toMatchObject({ provider: "openai", model: "model-that-does-not-exist" });
+
+			// A request that never opened still lands on the timeline. Nothing can
+			// proceed when the provider is unreachable, so the useful outcome is a
+			// session that says so — the same shape as any other failed turn, rather
+			// than a typed error that vanishes into a log line.
+			const [entry] = yield* sessions.path(sessionId);
+			expect(entry?.entry.type).toBe("assistant");
+			expect(JSON.parse(entry!.entry.data)).toMatchObject({ stopReason: "error" });
+			expect(JSON.parse(entry!.entry.data).errorMessage).toContain("model-that-does-not-exist");
 		}),
 	);
 
@@ -78,6 +92,7 @@ describe("runner LLM", () => {
 				context,
 				provider: "openai",
 				model: "gpt-4o-mini",
+				options: { sessionId },
 				publisher,
 			}).pipe(Effect.flip);
 
@@ -101,6 +116,7 @@ describe("runner LLM", () => {
 				context,
 				provider: "openai",
 				model: "gpt-4o-mini",
+				options: { sessionId },
 				publisher,
 			}).pipe(Effect.flip);
 

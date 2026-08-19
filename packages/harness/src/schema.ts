@@ -41,8 +41,27 @@ export const validateAikitUserMessage = (value: unknown, label: string): Message
 export const validateAikitAssistantMessage = (value: unknown, label: string): Message.AssistantMessage =>
 	validateAikitSchema(Message.AssistantMessageSchema, value, label);
 
+export const validateAikitPendingToolCall = (value: unknown, label: string): Message.ToolCallPendingPart =>
+	validateAikitSchema(Message.ToolCallPendingPartSchema, value, label);
+
+export const validateAikitToolCall = (value: unknown, label: string): Message.ToolCall =>
+	validateAikitSchema(Message.ToolCallSchema, value, label);
+
 export const isAikitAssistantMessage = (value: unknown): value is Message.AssistantMessage =>
 	aikitValidatorFor(Message.AssistantMessageSchema).Check(value);
+
+/**
+ * A refinement plus a validator for one aikit TypeBox schema.
+ *
+ * The pair is what an Effect Schema adapter needs — `is` for the declaration,
+ * `validate` for the transform — and every durable event that persists an aikit
+ * value needs the same pair for a different schema. Exposing the factory keeps
+ * the compiled-validator cache above in one place.
+ */
+export const aikitValidator = <T extends TSchema>(schema: T, label: string) => ({
+	is: (value: unknown): value is Static<T> => aikitValidatorFor(schema).Check(value),
+	validate: (value: unknown): Static<T> => validateAikitSchema(schema, value, label),
+});
 
 /**
  * Integer greater than zero.

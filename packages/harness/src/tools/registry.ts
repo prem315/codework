@@ -25,7 +25,7 @@ export interface Resolved {
 	/** The aikit wire view handed to the LLM request as `tools`. */
 	readonly wire: ReadonlyArray<Message.Tool>;
 	/**
-	 * Transform one complete pending tool-call part into a complete terminal part. The **only**
+	 * Transform one complete tool-call input into a complete terminal part. The **only**
 	 * execution entry point — the
 	 * loop never runs a tool any other way. This is the executor's `handle` re-exposed; because
 	 * the catalog holds `RegisteredTool`s (capability `R` discharged), only a progress sink's own

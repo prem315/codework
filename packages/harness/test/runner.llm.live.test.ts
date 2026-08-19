@@ -34,6 +34,20 @@ const setup = Effect.gen(function* () {
 	return { sql, sessions, sessionId: session.id };
 });
 
+/*
+ * What `runtimeOptions` used to hardcode inside `LLM.open`. It moved out to the
+ * caller, so these cases now state it: the first asserts on thinking deltas,
+ * which only arrive when reasoning is requested and summaries are on.
+ */
+const options = (sessionId: string) =>
+	({
+		sessionId,
+		reasoning: "high",
+		providerOptions: { openai: { reasoningSummary: "auto" } },
+		timeoutMs: 60_000,
+		maxRetries: 0,
+	}) satisfies LLM.RequestOptions;
+
 const context = (text: string): Message.Context => ({
 	systemPrompt: "Follow the user instruction exactly.",
 	messages: [
@@ -59,7 +73,7 @@ describe("runner LLM — OpenAI live", () => {
 			);
 			yield* Effect.addFinalizer(() => removeListener);
 
-			const publisher = yield* LLMEventPublisher.make({ sessionId });
+			const publisher = yield* LLMEventPublisher.make({ sessionId, provider: "openai", model: "gpt-5.5" });
 			const terminal = yield* LLM.run({
 				sessionId,
 				context: context(
@@ -67,6 +81,7 @@ describe("runner LLM — OpenAI live", () => {
 				),
 				provider: "openai",
 				model: "gpt-5.5",
+				options: options(sessionId),
 				publisher,
 			});
 
@@ -81,8 +96,16 @@ describe("runner LLM — OpenAI live", () => {
 			if (stored.role !== "assistant") return yield* Effect.die(`stored message is ${stored.role}, not assistant`);
 			expect(stored.parts.some((part) => part.type === "thinking" && part.thinking.trim().length > 0)).toBe(true);
 
-			const durable = yield* sql`SELECT type FROM event ORDER BY seq`;
-			expect(durable.map((row) => row.type)).toEqual(["session.llm.ended.1"]);
+			/*
+			 * One allocation, one row per completed block, one terminal. The block
+			 * count is the model's to choose, so the assertion is on the shape: a
+			 * durable thinking block is also a stronger signal than the delta count
+			 * above, which a response is free not to summarize.
+			 */
+			const durable = (yield* sql`SELECT type FROM event ORDER BY seq`).map((row) => row.type);
+			expect(durable.at(0)).toBe("session.llm.started.1");
+			expect(durable.at(-1)).toBe("session.llm.ended.1");
+			expect(durable).toContain("session.llm.thinking.end.1");
 		}),
 		{ timeout: 180_000 },
 	);
@@ -101,12 +124,13 @@ describe("runner LLM — OpenAI live", () => {
 						: Effect.void,
 			);
 
-			const publisher = yield* LLMEventPublisher.make({ sessionId });
+			const publisher = yield* LLMEventPublisher.make({ sessionId, provider: "openai", model: "gpt-5.5" });
 			const running = yield* LLM.run({
 				sessionId,
 				context: context("List 200 distinct first names, one per line."),
 				provider: "openai",
 				model: "gpt-5.5",
+				options: options(sessionId),
 				publisher,
 			}).pipe(Effect.forkChild);
 			const interruptedPart = yield* Deferred.await(streaming);

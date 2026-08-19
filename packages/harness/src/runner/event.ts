@@ -20,7 +20,7 @@
  * to flush.
  */
 
-import type { Event as AikitEvent, Message } from "@codeworksh/aikit";
+import { Model, type Event as AikitEvent, type Message } from "@codeworksh/aikit";
 import { DateTime, Effect } from "effect";
 import { Event } from "../event/event.ts";
 import { EventList } from "../event/list.ts";
@@ -44,11 +44,50 @@ export type Terminal =
 export interface Publisher {
 	/** Interpret one provider event. Durable ones commit before this returns. */
 	readonly publish: (event: AikitEvent.LLMMessageEvent) => Effect.Effect<void, Runner.LLMStreamError>;
+	/**
+	 * Record a failure that will produce no aikit terminal -- an unresolvable
+	 * model, or a stream that threw before it opened.
+	 *
+	 * The assistant entry is created first, so an unreachable provider still
+	 * lands on the timeline as a failed assistant rather than vanishing into a
+	 * typed error and a log line. A no-op once the response has settled.
+	 */
+	readonly failAssistant: (input: {
+		readonly reason: "aborted" | "error";
+		readonly errorMessage: string;
+	}) => Effect.Effect<void, Runner.LLMStreamError>;
 	/** How the response settled; fails if the stream ended without terminating. */
 	readonly terminal: Effect.Effect<Terminal, Runner.LLMStreamError>;
 }
 
-export const make = Effect.fn("LLMEventPublisher.make")(function* (input: { readonly sessionId: SessionSchema.ID }) {
+const zeroUsage: Message.Usage = {
+	input: 0,
+	output: 0,
+	cacheRead: 0,
+	cacheWrite: 0,
+	totalTokens: 0,
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+};
+
+const knownProtocols: ReadonlySet<string> = new Set(Object.values(Model.KnownProviderEnum));
+
+/**
+ * Best-effort protocol for an envelope no provider ever produced.
+ *
+ * Every real response carries aikit's own resolved protocol. This is the other
+ * case: the request never reached a provider, so nothing resolved one, and the
+ * envelope still has to name it. `openai-compatible` is the honest default for
+ * a provider id aikit does not recognize -- it is what an unknown provider
+ * would have spoken had it answered.
+ */
+const protocolOf = (provider: string): Model.KnownProviderEnum =>
+	knownProtocols.has(provider) ? (provider as Model.KnownProviderEnum) : Model.KnownProviderEnum.openaiCompatible;
+
+export const make = Effect.fn("LLMEventPublisher.make")(function* (input: {
+	readonly sessionId: SessionSchema.ID;
+	readonly provider: string;
+	readonly model: string;
+}) {
 	const events = yield* Event.Service;
 
 	let messageId: SessionMessageSchema.ID | undefined;
@@ -78,6 +117,143 @@ export const make = Effect.fn("LLMEventPublisher.make")(function* (input: { read
 				: Effect.fail(fault(`message id changed mid-response: "${messageId}" then "${id}"`));
 		});
 
+	/**
+	 * The envelope the assistant entry is created from: identity and provenance,
+	 * no content.
+	 *
+	 * `parts` is emptied because block completions fill them one slot at a time,
+	 * and `usage` is zeroed because usage is charged exactly once, at
+	 * finalization -- a partial that already carried a count would be charged
+	 * twice. `stopReason` is `aborted` so a crash mid-stream leaves an entry that
+	 * is already correctly marked; the terminal promotes it.
+	 *
+	 * Nested objects are copied rather than shared. aikit rewrites `partial` in
+	 * place as the stream advances, so anything this envelope keeps by reference
+	 * would keep changing under the durable value.
+	 */
+	const creationEnvelope = (source: Message.AssistantMessage): Message.AssistantMessage => ({
+		...source,
+		provider: { ...source.provider },
+		time: { ...source.time },
+		usage: { ...zeroUsage, cost: { ...zeroUsage.cost } },
+		parts: [],
+		stopReason: "aborted",
+	});
+
+	/**
+	 * Create the assistant entry, once.
+	 *
+	 * Every path that needs an assistant goes through here, so there is one
+	 * creation site rather than a normal path plus a projector fallback -- the
+	 * projectors stay pure projections with no conditional create. Later calls
+	 * return the id the first one minted.
+	 */
+	const startAssistant = (
+		seed?: Message.AssistantMessage,
+	): Effect.Effect<SessionMessageSchema.ID, Runner.LLMStreamError> =>
+		Effect.gen(function* () {
+			// A terminal still has its identity checked: arriving under a different
+			// message id means two responses are interleaving on one stream.
+			if (messageId !== undefined) return seed === undefined ? messageId : yield* identify(seed.messageId);
+			const now = yield* DateTime.now;
+			const created = DateTime.toEpochMillis(now);
+			const envelope = creationEnvelope(
+				seed ?? {
+					messageId: SessionMessageSchema.ID.create(),
+					role: "assistant",
+					protocol: protocolOf(input.provider),
+					provider: { id: input.provider, name: input.provider, source: "custom", env: [] },
+					model: input.model,
+					usage: zeroUsage,
+					stopReason: "aborted",
+					time: { created, completed: created },
+					parts: [],
+				},
+			);
+			const id = yield* identify(envelope.messageId);
+			yield* events.publish(EventList.LLMStarted, {
+				sessionId: input.sessionId,
+				timestamp: now,
+				messageId: id,
+				message: envelope,
+			});
+			return id;
+		});
+
+	/**
+	 * The assistant a part event belongs to. Dying is the point: a part with no
+	 * assistant means the stream is broken and there is nothing to salvage,
+	 * whereas a terminal with no assistant is an ordinary failure carrying a
+	 * complete message to record.
+	 */
+	const requireAssistant = (type: string, observed: string) =>
+		Effect.suspend(() =>
+			messageId === undefined
+				? Effect.die(`llm: "${type}" arrived before the assistant was started`)
+				: identify(observed),
+		);
+
+	const failAssistant = (failure: {
+		readonly reason: "aborted" | "error";
+		readonly errorMessage: string;
+	}): Effect.Effect<void, Runner.LLMStreamError> =>
+		Effect.gen(function* () {
+			if (settled !== undefined) return;
+			const id = yield* startAssistant();
+			const now = yield* DateTime.now;
+			const completed = DateTime.toEpochMillis(now);
+			const message: Message.AssistantMessage = {
+				messageId: id,
+				role: "assistant",
+				protocol: protocolOf(input.provider),
+				provider: { id: input.provider, name: input.provider, source: "custom", env: [] },
+				model: input.model,
+				usage: zeroUsage,
+				stopReason: failure.reason,
+				errorMessage: failure.errorMessage,
+				time: { created: completed, completed },
+				parts: [],
+			};
+			yield* events.publish(EventList.LLMFailed, {
+				sessionId: input.sessionId,
+				timestamp: now,
+				messageId: id,
+				reason: failure.reason,
+				message,
+			});
+			settled = { outcome: "failed", reason: failure.reason, message };
+		});
+
+	/*
+	 * The finished block a `*.end` event refers to.
+	 *
+	 * aikit's end events carry only the block's text, but it writes
+	 * `textSignature` / `thinkingSignature` onto the block immediately before
+	 * pushing (`aikit/llm/stream.ts:253-282`), and those signatures are what a
+	 * provider needs to continue a reasoning thread across turns. A durable write
+	 * built from the scalar would drop them, leaving a resumed session unable to
+	 * continue its own thinking.
+	 *
+	 * Reading `partial` is safe here and nowhere else: a completed block is the
+	 * one thing in that object aikit will not touch again. It is copied anyway,
+	 * because the array around it keeps growing.
+	 */
+	const textBlock = (partial: Message.AssistantMessage, partIndex: number) =>
+		Effect.suspend(() => {
+			const block = partial.parts[partIndex];
+			return block?.type === "text"
+				? Effect.succeed({ ...block })
+				: Effect.fail(fault(`"text.end" names part ${partIndex}, which is not a text block`));
+		});
+
+	const thinkingBlock = (partial: Message.AssistantMessage, partIndex: number) =>
+		Effect.suspend(() => {
+			const block = partial.parts[partIndex];
+			return block?.type === "thinking"
+				? Effect.succeed({ ...block })
+				: Effect.fail(fault(`"thinking.end" names part ${partIndex}, which is not a thinking block`));
+		});
+
 	const publish = (event: AikitEvent.LLMMessageEvent): Effect.Effect<void, Runner.LLMStreamError> =>
 		Effect.gen(function* () {
 			// Exactly one terminal per response. A second, or anything after one,
@@ -90,10 +266,7 @@ export const make = Effect.fn("LLMEventPublisher.make")(function* (input: { read
 
 			switch (event.type) {
 				case "start": {
-					yield* events.publish(EventList.LLMStarted, {
-						...base,
-						messageId: yield* identify(event.partial.messageId),
-					});
+					yield* startAssistant(event.partial);
 					return;
 				}
 
@@ -111,7 +284,7 @@ export const make = Effect.fn("LLMEventPublisher.make")(function* (input: { read
 				case "text.start": {
 					yield* events.publish(EventList.LLMTextStart, {
 						...base,
-						messageId: yield* identify(event.partial.messageId),
+						messageId: yield* requireAssistant(event.type, event.partial.messageId),
 						partIndex: event.partIndex,
 					});
 					return;
@@ -119,7 +292,7 @@ export const make = Effect.fn("LLMEventPublisher.make")(function* (input: { read
 				case "text.delta": {
 					yield* events.publish(EventList.LLMTextDelta, {
 						...base,
-						messageId: yield* identify(event.partial.messageId),
+						messageId: yield* requireAssistant(event.type, event.partial.messageId),
 						partIndex: event.partIndex,
 						delta: event.delta,
 					});
@@ -128,16 +301,16 @@ export const make = Effect.fn("LLMEventPublisher.make")(function* (input: { read
 				case "text.end": {
 					yield* events.publish(EventList.LLMTextEnd, {
 						...base,
-						messageId: yield* identify(event.partial.messageId),
+						messageId: yield* requireAssistant(event.type, event.partial.messageId),
 						partIndex: event.partIndex,
-						content: event.content,
+						part: yield* textBlock(event.partial, event.partIndex),
 					});
 					return;
 				}
 				case "thinking.start": {
 					yield* events.publish(EventList.LLMThinkingStart, {
 						...base,
-						messageId: yield* identify(event.partial.messageId),
+						messageId: yield* requireAssistant(event.type, event.partial.messageId),
 						partIndex: event.partIndex,
 					});
 					return;
@@ -145,7 +318,7 @@ export const make = Effect.fn("LLMEventPublisher.make")(function* (input: { read
 				case "thinking.delta": {
 					yield* events.publish(EventList.LLMThinkingDelta, {
 						...base,
-						messageId: yield* identify(event.partial.messageId),
+						messageId: yield* requireAssistant(event.type, event.partial.messageId),
 						partIndex: event.partIndex,
 						delta: event.delta,
 					});
@@ -154,34 +327,69 @@ export const make = Effect.fn("LLMEventPublisher.make")(function* (input: { read
 				case "thinking.end": {
 					yield* events.publish(EventList.LLMThinkingEnd, {
 						...base,
-						messageId: yield* identify(event.partial.messageId),
+						messageId: yield* requireAssistant(event.type, event.partial.messageId),
 						partIndex: event.partIndex,
-						content: event.content,
+						part: yield* thinkingBlock(event.partial, event.partIndex),
+					});
+					return;
+				}
+
+				case "toolcall.start": {
+					yield* events.publish(EventList.LLMToolCallStarted, {
+						...base,
+						messageId: yield* requireAssistant(event.type, event.partial.messageId),
+						partIndex: event.partIndex,
+					});
+					return;
+				}
+				case "toolcall.delta": {
+					yield* events.publish(EventList.LLMToolCallDelta, {
+						...base,
+						messageId: yield* requireAssistant(event.type, event.partial.messageId),
+						partIndex: event.partIndex,
+						delta: event.delta,
+					});
+					return;
+				}
+				case "toolcall.end": {
+					yield* events.publish(EventList.LLMToolCallEnded, {
+						...base,
+						messageId: yield* requireAssistant(event.type, event.partial.messageId),
+						partIndex: event.partIndex,
+						callId: event.toolCall.callID,
+						toolName: event.toolCall.name,
 					});
 					return;
 				}
 
 				/*
-				 * Out of scope for this phase, and unreachable in practice: the loop
-				 * registers no tools, so a provider has nothing to call. Logged rather
-				 * than failed because a stray tool event is the provider misbehaving,
-				 * not a reason to lose the response -- the terminal message still
-				 * carries the call, and the durable projection stores it verbatim.
+				 * The third block completion, and the only durable tool-call event. The
+				 * call is written at its `partIndex` with canonical arguments and status
+				 * `pending`: the model has finished asking, and nothing has run.
 				 */
-				case "toolcall.start":
-				case "toolcall.delta":
-				case "toolcall.end":
 				case "toolcall.final": {
-					yield* Effect.logWarning("llm: tool-call event with no tools registered").pipe(
-						Effect.annotateLogs({ sessionId: input.sessionId, type: event.type, partIndex: event.partIndex }),
-					);
+					const messageId = yield* requireAssistant(event.type, event.partial.messageId);
+					const part = event.toolCall;
+					if (part.status !== "pending") {
+						return yield* fault(
+							`"toolcall.final" for call "${part.callID}" arrived with status "${part.status}"; nothing has executed it yet`,
+						);
+					}
+					yield* events.publish(EventList.LLMToolCallFinalized, {
+						...base,
+						messageId,
+						partIndex: event.partIndex,
+						callId: part.callID,
+						toolName: part.name,
+						part: { ...part },
+					});
 					return;
 				}
 
 				case "done": {
 					yield* events.publish(EventList.LLMEnded, {
 						...base,
-						messageId: yield* identify(event.message.messageId),
+						messageId: yield* startAssistant(event.message),
 						reason: event.reason,
 						message: event.message,
 					});
@@ -200,7 +408,7 @@ export const make = Effect.fn("LLMEventPublisher.make")(function* (input: { read
 				case "error": {
 					yield* events.publish(EventList.LLMFailed, {
 						...base,
-						messageId: yield* identify(event.error.messageId),
+						messageId: yield* startAssistant(event.error),
 						reason: event.reason,
 						message: event.error,
 					});
@@ -216,7 +424,7 @@ export const make = Effect.fn("LLMEventPublisher.make")(function* (input: { read
 			: Effect.succeed(settled),
 	);
 
-	return { publish, terminal } satisfies Publisher;
+	return { publish, failAssistant, terminal } satisfies Publisher;
 });
 
 export * as LLMEventPublisher from "./event.ts";

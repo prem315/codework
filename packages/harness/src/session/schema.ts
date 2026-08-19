@@ -71,4 +71,12 @@ export type Usage = typeof Usage.Type;
 // JSON.parse failures land in the same SchemaError channel as shape failures.
 export const AssistantEnvelopeUsage = Schema.fromJsonString(Schema.Struct({ usage: Usage }));
 
+// The one envelope field the store itself branches on. An assistant entry is
+// created `aborted` at the start of a response and promoted to its true reason
+// when the response terminates, so `stopReason` is what distinguishes an entry
+// still being written from one that is finished and immutable.
+export const AssistantEnvelopeState = Schema.fromJsonString(
+	Schema.Struct({ stopReason: Schema.Literals(["stop", "length", "toolUse", "error", "aborted"]) }),
+);
+
 export * as SessionSchema from "./schema.ts";

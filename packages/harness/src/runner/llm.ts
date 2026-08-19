@@ -12,18 +12,36 @@ import {
 	llm,
 	type Event as AikitEvent,
 	type Message,
+	type Model,
 	type OpenAIOptions,
 } from "@codeworksh/aikit";
 import { Effect, Exit, Fiber, Scope, Stream } from "effect";
 import type { SessionSchema } from "../session/schema.ts";
+import type { State } from "../state/state.ts";
 import { LLMEventPublisher } from "./event.ts";
 import { Runner } from "./run.ts";
+
+/**
+ * The resolved aikit option bag for one request.
+ *
+ * State supplies the caller-facing half; Loop adds the two fields State
+ * deliberately withholds -- `sessionId`, which the loop owns, and `reasoning`,
+ * which it derives from the pinned thinking level. This module adds `signal` and
+ * nothing else, because `signal` is bound to the scope that aborts the transport
+ * on interruption and a caller value would silently break cancellation.
+ */
+export type RequestOptions = State.RequestOptions & {
+	readonly sessionId: string;
+	readonly reasoning?: Model.ActiveThinkingLevel;
+};
 
 export interface Input {
 	readonly sessionId: SessionSchema.ID;
 	readonly context: Message.Context;
 	readonly provider: string;
 	readonly model: string;
+	/** Fully resolved by the loop; this module neither defaults nor overrides it. */
+	readonly options: RequestOptions;
 }
 
 export interface RequestInput extends Input {
@@ -42,16 +60,6 @@ export type Request = (
 	Runner.ModelNotFoundError | Runner.ProviderTurnError | Runner.LLMStreamError
 >;
 
-const runtimeOptions = (input: Input, signal: AbortSignal): OpenAIOptions => ({
-	maxTokens: 1_024,
-	reasoning: "high",
-	providerOptions: { openai: { reasoningSummary: "auto" } },
-	timeoutMs: 60_000,
-	maxRetries: 0,
-	sessionId: input.sessionId,
-	signal,
-});
-
 /** Resolve the configured model and start aikit's provider stream. */
 export const open: Open = Effect.fn("LLM.open")(function* (input, signal) {
 	const model = yield* Effect.tryPromise({
@@ -63,10 +71,25 @@ export const open: Open = Effect.fn("LLM.open")(function* (input, signal) {
 	}
 
 	return yield* Effect.try({
-		try: () => aikitStream(model, input.context, runtimeOptions(input, signal)),
+		/*
+		 * The one cast in the request path, and it is deliberately here rather than
+		 * in the type of the bag. aikit's option type is generic per protocol
+		 * (`Protocol.OptionsFor<TProtocol>`); ours is the erased form, so a
+		 * provider-agnostic loop cannot name the concrete one. Naming a protocol at
+		 * the call site is the narrowest place to erase that difference -- the same
+		 * move the tool registry makes when it discharges a tool's capability `R`.
+		 */
+		try: () => aikitStream(model, input.context, { ...input.options, signal } as OpenAIOptions),
 		catch: (cause) => new Runner.ProviderTurnError({ provider: input.provider, model: input.model, cause }),
 	});
 });
+
+const openFailureMessage = (cause: Runner.ModelNotFoundError | Runner.ProviderTurnError): string =>
+	cause._tag === "Runner.ModelNotFoundError"
+		? `Model "${cause.model}" is not available from provider "${cause.provider}"`
+		: `Provider "${cause.provider}" could not start a response: ${
+				cause.cause instanceof Error ? cause.cause.message : String(cause.cause)
+			}`;
 
 /**
  * Build a provider request from an opener. Tests use this with deterministic
@@ -86,7 +109,22 @@ export const make = (openStream: Open): Request => {
 
 		return yield* Effect.uninterruptibleMask((restore) =>
 			Effect.gen(function* () {
-				const iterable = yield* restore(openStream(input, signal)).pipe(Effect.onInterrupt(() => abort));
+				/*
+				 * A failure here produced no aikit events at all -- an unresolvable
+				 * model, or a transport that threw before the stream opened. Routing it
+				 * through the publisher first is what puts it on the timeline as a
+				 * failed assistant entry rather than letting it vanish into a typed
+				 * error, which is the only durable record a turn that never reached the
+				 * provider can leave.
+				 */
+				const iterable = yield* restore(openStream(input, signal)).pipe(
+					Effect.onInterrupt(() => abort),
+					Effect.tapError((cause) =>
+						input.publisher
+							.failAssistant({ reason: "error", errorMessage: openFailureMessage(cause) })
+							.pipe(Effect.ignore),
+					),
+				);
 				const consume = Stream.fromAsyncIterable(
 					iterable,
 					(cause) => new Runner.ProviderTurnError({ provider: input.provider, model: input.model, cause }),

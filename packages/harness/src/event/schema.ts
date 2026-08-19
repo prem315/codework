@@ -1,7 +1,14 @@
 import { Message } from "@codeworksh/aikit";
 import { Effect, Schema, type SchemaAST, SchemaGetter, SchemaIssue } from "effect";
+import type { Static, TSchema } from "typebox";
 import { uuidv7 } from "uuidv7";
-import { isAikitAssistantMessage, optional, validateAikitAssistantMessage, withStatics } from "../schema.ts";
+import {
+	aikitValidator,
+	isAikitAssistantMessage,
+	optional,
+	validateAikitAssistantMessage,
+	withStatics,
+} from "../schema.ts";
 
 type AikitAssistantPart = Message.AssistantMessage["parts"][number];
 
@@ -27,6 +34,34 @@ const canonicalizeAikitAssistantMessage = (message: Message.AssistantMessage): M
 
 const reasonOf = (cause: unknown): string => (cause instanceof Error ? cause.message : String(cause));
 
+/**
+ * Effect Schema adapter for one aikit TypeBox value.
+ *
+ * A durable event that persists an aikit value needs the same three things
+ * every time: a refinement for the declaration, a validating transform in both
+ * directions, and a canonicalizer that strips fields aikit only uses while a
+ * block is streaming. Encode runs the same transform as decode deliberately —
+ * the value is stored verbatim, so what goes in must satisfy what comes out.
+ */
+const aikitValue = <T extends TSchema>(
+	schema: T,
+	expected: string,
+	canonicalize: (value: Static<T>) => Static<T> = (value) => value,
+) => {
+	const { is, validate } = aikitValidator(schema, expected);
+	const transform = (value: unknown, options: SchemaAST.ParseOptions) =>
+		Effect.try({
+			try: () => canonicalize(validate(value)),
+			catch: (cause) => new SchemaIssue.InvalidValue({ message: reasonOf(cause) }, value, options),
+		});
+	return Schema.Unknown.pipe(
+		Schema.decodeTo(Schema.declare<Static<T>>(is, { expected }), {
+			decode: SchemaGetter.transformOrFail(transform),
+			encode: SchemaGetter.transformOrFail(transform),
+		}),
+	);
+};
+
 const decodeAikitAssistantMessage = (value: unknown, options: SchemaAST.ParseOptions) =>
 	Effect.try({
 		try: () => canonicalizeAikitAssistantMessage(validateAikitAssistantMessage(value, "aikit assistant message")),
@@ -48,6 +83,64 @@ export const AikitAssistantMessage = Schema.Unknown.pipe(
 	}),
 );
 export type AikitAssistantMessage = typeof AikitAssistantMessage.Type;
+
+/**
+ * The two block completions that project a part on their own.
+ *
+ * They carry the finished block rather than its text because aikit sets
+ * `textSignature` / `thinkingSignature` on the block *before* pushing the end
+ * event (`aikit/llm/stream.ts:253-282`). Those signatures are what a provider
+ * needs to continue a multi-turn reasoning thread, so a durable write that
+ * dropped them would leave a crashed session unable to resume its own thinking.
+ */
+export const AikitTextPart = aikitValue(Message.TextContentSchema, "aikit TextContent", (part) =>
+	omit(part, aikitTransientFields.text),
+);
+export type AikitTextPart = typeof AikitTextPart.Type;
+
+export const AikitThinkingPart = aikitValue(Message.ThinkingContentSchema, "aikit ThinkingContent", (part) =>
+	omit(part, aikitTransientFields.thinking),
+);
+export type AikitThinkingPart = typeof AikitThinkingPart.Type;
+
+/**
+ * The third block completion: the model has finished asking for a call.
+ *
+ * Pinned to the `pending` member of aikit's `ToolCall` union rather than the
+ * union itself, because that is the whole content of the event. `final` means
+ * the arguments are complete and nothing has run -- the transition into
+ * `running` belongs to `ToolExecutionStarted`, which is what makes "pending
+ * provably never ran" a fact the recovery sweep can rely on.
+ */
+export const AikitToolCallPendingPart = aikitValue(
+	Message.ToolCallPendingPartSchema,
+	"aikit pending ToolCall",
+	(part) => omit(part, aikitTransientFields.toolCall),
+);
+export type AikitToolCallPendingPart = typeof AikitToolCallPendingPart.Type;
+
+/** A call the harness has begun executing. Live progress and the durable start. */
+export const AikitToolCallRunningPart = aikitValue(
+	Message.ToolCallRunningPartSchema,
+	"aikit running ToolCall",
+	(part) => omit(part, aikitTransientFields.toolCall),
+);
+export type AikitToolCallRunningPart = typeof AikitToolCallRunningPart.Type;
+
+/**
+ * A settled call, in any of its four terminal states.
+ *
+ * One codec for all of them, matching the single `ToolExecutionEnded` event:
+ * `completed`, `error`, `skipped`, and `aborted` all come out of the same
+ * `Executor.handle` pipeline as ordinary return values, project identically,
+ * and already carry their status in the part JSON.
+ */
+export const AikitToolCallTerminalPart = aikitValue(
+	Message.ToolCallTerminalPartSchema,
+	"aikit terminal ToolCall",
+	(part) => omit(part, aikitTransientFields.toolCall),
+);
+export type AikitToolCallTerminalPart = typeof AikitToolCallTerminalPart.Type;
 
 export const ID = Schema.String.pipe(
 	Schema.brand("Event.ID"),

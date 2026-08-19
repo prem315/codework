@@ -49,6 +49,24 @@ export class ToolCallNotFoundError extends Schema.TaggedError<ToolCallNotFoundEr
 	callId: Schema.String,
 }) {}
 
+/**
+ * A tool-call transition that cannot be reconciled with what is stored.
+ *
+ * Separate from {@link ToolCallNotFoundError} because the two mean opposite
+ * things: "no such call" is a lookup miss, while this is a call whose recorded
+ * history disagrees with what is being written over it — a different session, a
+ * different tool, or a transition out of a state it has already left. The
+ * settlement must roll back rather than win.
+ *
+ * Replaying the *same* value is not a conflict. A durable event can be projected
+ * more than once, and an identical write is how idempotence is supposed to look.
+ */
+export class ToolCallConflictError extends Schema.TaggedError<ToolCallConflictError>()("ToolCallConflictError", {
+	entryId: Schema.String,
+	callId: Schema.String,
+	reason: Schema.String,
+}) {}
+
 // Structural rejection — the data-structure layer's "index out of bounds".
 export class InvalidEntryDataError extends Schema.TaggedError<InvalidEntryDataError>()("InvalidEntryDataError", {
 	entryId: Schema.String,
@@ -101,9 +119,66 @@ export interface AppendEntry {
 	readonly metadata?: Readonly<Record<string, string>>;
 }
 
+/**
+ * Write one part at a known index, creating it or replacing what is there.
+ *
+ * The addressing unit is `(entryId, partIndex)` — aikit's own — so a block
+ * completion writes into the slot the model assigned it, and a terminal that
+ * re-states the whole array overwrites slot by slot rather than appending a
+ * second copy. The unique index it relies on already exists
+ * (`db/migrations.ts:193`).
+ */
+export interface UpsertPart {
+	readonly id?: string; // uuidv7; generated when omitted
+	readonly sessionId: SessionSchema.ID;
+	readonly entryId: string;
+	readonly partIndex: number;
+	readonly type: PartType;
+	readonly status?: ToolStatus; // toolCall parts only
+	readonly callId?: string; // toolCall parts only
+	readonly toolName?: string; // toolCall parts only
+	readonly data: string; // verbatim aikit part JSON
+}
+
+/**
+ * Promote an assistant entry from `aborted` to its terminal reason.
+ *
+ * The counterpart to creating the entry at `LLMStarted`: creation allocates the
+ * array and charges nothing, finalization replaces the envelope with the
+ * terminal one, reconciles the parts against it, and charges usage — exactly
+ * once, because this is the only place that charges it for a streamed response.
+ *
+ * The envelope is immutable once finalized. A second call is rejected rather
+ * than applied, so "the response settled twice" cannot silently double-charge.
+ */
+export interface FinalizeAssistant {
+	readonly sessionId: SessionSchema.ID;
+	readonly entryId: string;
+	readonly data: string; // final aikit envelope JSON, without parts
+	readonly parts: ReadonlyArray<AppendPart>; // authoritative; order = partIndex
+}
+
+/**
+ * `pending -> running`, published immediately before a handler is invoked.
+ *
+ * Carries the running part rather than only a status because the promoted
+ * column and the authoritative JSON have to agree — `decodeParts` re-checks
+ * that on the way back, so writing one without the other would make the row
+ * unreadable.
+ */
+export interface BeginToolCall {
+	readonly sessionId: SessionSchema.ID; // ownership, checked not assumed
+	readonly entryId: string; // owning assistant entry
+	readonly callId: string;
+	readonly toolName: string; // continuity: the call must still be the same tool
+	readonly data: string; // running aikit part JSON, verbatim
+}
+
 export interface SettleToolCall {
+	readonly sessionId: SessionSchema.ID; // ownership, checked not assumed
 	readonly entryId: string; // owning assistant entry
 	readonly callId: string; // from the loop's tool.execution.end
+	readonly toolName: string; // continuity: the call must still be the same tool
 	readonly status: Exclude<ToolStatus, "pending" | "running">;
 	readonly data: string; // settled aikit part JSON, verbatim
 }
@@ -142,10 +217,42 @@ export interface Interface {
 	}) => Effect.Effect<HydratedEntry[]>;
 	/** Unsettled toolCall parts (crash recovery / live status). */
 	readonly unsettled: (sessionId: SessionSchema.ID) => Effect.Effect<SessionEntryPartRow[]>;
+	/**
+	 * The newest assistant entry on the active path, with its parts.
+	 *
+	 * Not the leaf. `leaf_entry_id` is the tree cursor -- where the next append
+	 * attaches -- so it moves to whatever was written last, including a config
+	 * change or an annotation between turns. Callers asking "which assistant
+	 * might still be in flight" want this instead, and it stays correct however
+	 * many non-message entries were written after it.
+	 *
+	 * Path-scoped, so abandoned branches are excluded -- which is why the
+	 * session-wide `unsettled` read is not a substitute.
+	 */
+	readonly latestAssistant: (sessionId: SessionSchema.ID) => Effect.Effect<Option.Option<HydratedEntry>>;
+	/**
+	 * One entry's toolCall parts in `partIndex` order.
+	 *
+	 * The loop's re-read: it schedules what is committed, not what the terminal
+	 * message it holds in memory happens to say. Same data, but reading it from
+	 * storage is what makes execution resumable and keeps one rule — execute what
+	 * is durable — true in every phase.
+	 */
+	readonly toolCalls: (entryId: string) => Effect.Effect<SessionEntryPartRow[]>;
 	readonly append: (
 		input: AppendEntry,
 	) => Effect.Effect<SessionEntryRow, SessionNotFoundError | EntryNotFoundError | InvalidEntryDataError>;
-	readonly settleToolCall: (input: SettleToolCall) => Effect.Effect<void, ToolCallNotFoundError>;
+	/** Write one part at `(entryId, partIndex)`, creating or replacing it. */
+	readonly upsertPart: (input: UpsertPart) => Effect.Effect<void, EntryNotFoundError | InvalidEntryDataError>;
+	/** Promote a streamed assistant entry to its terminal envelope; charges usage. */
+	readonly finalizeAssistant: (
+		input: FinalizeAssistant,
+	) => Effect.Effect<void, EntryNotFoundError | InvalidEntryDataError>;
+	/** `pending -> running`; the only transition into `running`. */
+	readonly beginToolCall: (input: BeginToolCall) => Effect.Effect<void, ToolCallNotFoundError | ToolCallConflictError>;
+	readonly settleToolCall: (
+		input: SettleToolCall,
+	) => Effect.Effect<void, ToolCallNotFoundError | ToolCallConflictError>;
 	/** Copy root→fork-point into a new session (`parentId` = source). Clone = fork at leaf. */
 	readonly fork: (
 		input: ForkInput,
@@ -170,6 +277,17 @@ const messageTypes: ReadonlySet<string> = new Set(messageEntryTypes);
 // Structural decode of the persisted envelope's usage; failures surface as
 // InvalidEntryDataError, never a defect — callers (Context Manager, UI) can act.
 const decodeEnvelopeUsage = Schema.decodeUnknownEffect(SessionSchema.AssistantEnvelopeUsage);
+const decodeEnvelopeState = Schema.decodeUnknownEffect(SessionSchema.AssistantEnvelopeState);
+
+/** What an entry has been charged for when its envelope carries no usage yet. */
+const zeroUsage: SessionSchema.Usage = {
+	input: 0,
+	output: 0,
+	cacheRead: 0,
+	cacheWrite: 0,
+	totalTokens: 0,
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+};
 const decodeMessageEnvelopeIdentity = Schema.decodeUnknownEffect(SessionSchema.MessageEnvelopeIdentity);
 const decodeCompactionData = Schema.decodeUnknownEffect(SessionSchema.CompactionData);
 const decodeJsonObject = Schema.decodeUnknownEffect(SessionSchema.JsonObject);
@@ -296,6 +414,33 @@ export const layer = Layer.effect(
 			`,
 		});
 
+		// The path walk, stopped at the newest assistant. Same recursive CTE as
+		// `selectPath`, filtered and limited in SQL rather than by reading the whole
+		// path back and scanning it here.
+		const selectLatestAssistant = SqlSchema.findOneOption({
+			Request: Schema.String,
+			Result: SessionEntryRow,
+			execute: (leafEntryId) => sql`
+				WITH RECURSIVE path AS (
+					SELECT * FROM session_entry WHERE id = ${leafEntryId}
+					UNION ALL
+					SELECT e.* FROM session_entry e
+					JOIN path p ON e.id = p.parent_id AND e.session_id = p.session_id
+				)
+				SELECT * FROM path WHERE type = 'assistant' ORDER BY seq DESC LIMIT 1
+			`,
+		});
+
+		const selectToolCalls = SqlSchema.findAll({
+			Request: Schema.String,
+			Result: SessionEntryPartRow,
+			execute: (entryId) => sql`
+				SELECT * FROM session_entry_part
+				WHERE entry_id = ${entryId} AND type = 'toolCall'
+				ORDER BY part_index
+			`,
+		});
+
 		const epochNow = Effect.map(DateTime.now, DateTime.toEpochMillis);
 
 		// Zip rule (§7.2): group parts by entry id, attach while walking entries.
@@ -391,6 +536,21 @@ export const layer = Layer.effect(
 
 		const unsettled = Effect.fn("Session.unsettled")(function* (sessionId: string) {
 			return yield* selectUnsettled(sessionId).pipe(Effect.orDie);
+		});
+
+		const latestAssistant = Effect.fn("Session.latestAssistant")(function* (sessionId: SessionSchema.ID) {
+			const session = yield* findSession(sessionId).pipe(Effect.orDie);
+			if (Option.isNone(session)) return Option.none<HydratedEntry>();
+			const leaf = yield* resolveLeaf(session.value);
+			if (Option.isNone(leaf)) return Option.none<HydratedEntry>();
+			const found = yield* selectLatestAssistant(leaf.value).pipe(Effect.orDie);
+			if (Option.isNone(found)) return Option.none<HydratedEntry>();
+			const parts = yield* partsFor([found.value]);
+			return Option.some(hydrate([found.value], parts)[0]!);
+		});
+
+		const toolCalls = Effect.fn("Session.toolCalls")(function* (entryId: string) {
+			return yield* selectToolCalls(entryId).pipe(Effect.orDie);
 		});
 
 		type AppendTxResult =
@@ -581,29 +741,325 @@ export const layer = Layer.effect(
 			}
 		});
 
-		const settleToolCall = Effect.fn("Session.settleToolCall")(function* (input: SettleToolCall) {
-			const settled = yield* sql
+		// ON CONFLICT over the unique `(entry_id, part_index)` index. `id` is
+		// preserved on update: a slot rewritten by the terminal is the same part
+		// the block completion wrote, and rotating its row id would break anything
+		// holding a reference to it.
+		const upsertPartRow = SqlSchema.void({
+			Request: SessionEntryPartRow.insert,
+			execute: (row) => sql`
+				INSERT INTO session_entry_part ${sql.insert(row)}
+				ON CONFLICT (entry_id, part_index) DO UPDATE SET
+					type = excluded.type,
+					status = excluded.status,
+					call_id = excluded.call_id,
+					tool_name = excluded.tool_name,
+					data = excluded.data,
+					updated_at = excluded.updated_at
+			`,
+		});
+
+		type PartTxResult =
+			| { readonly _tag: "entryNotFound" }
+			| { readonly _tag: "invalidData"; readonly reason: string }
+			| { readonly _tag: "written" };
+
+		const writePart = Effect.fnUntraced(function* (input: UpsertPart) {
+			const row = yield* SessionEntryPartRow.insert.makeEffect({
+				id: input.id ?? uuidv7(),
+				entryId: input.entryId,
+				sessionId: input.sessionId,
+				partIndex: input.partIndex,
+				type: input.type,
+				status: Option.fromUndefinedOr(input.status),
+				callId: Option.fromUndefinedOr(input.callId),
+				toolName: Option.fromUndefinedOr(input.toolName),
+				data: input.data,
+			});
+			yield* upsertPartRow(row);
+		});
+
+		const upsertPart = Effect.fn("Session.upsertPart")(function* (input: UpsertPart) {
+			yield* decodeJsonObject(input.data).pipe(
+				Effect.mapError(
+					(error) =>
+						new InvalidEntryDataError({
+							entryId: input.entryId,
+							type: input.type,
+							reason: `part ${input.partIndex} ("${input.type}") is not a JSON object: ${error.message}`,
+						}),
+				),
+			);
+
+			const result: PartTxResult = yield* sql
+				.withTransaction(
+					Effect.gen(function* () {
+						const owner = yield* findEntry(input.entryId);
+						if (Option.isNone(owner) || owner.value.sessionId !== input.sessionId) {
+							return { _tag: "entryNotFound" } as const;
+						}
+						if (!messageTypes.has(owner.value.type)) {
+							return {
+								_tag: "invalidData",
+								reason: `entry type "${owner.value.type}" must not carry parts`,
+							} as const;
+						}
+						yield* writePart(input);
+						return { _tag: "written" } as const;
+					}),
+				)
+				.pipe(Effect.orDie);
+
+			if (result._tag === "entryNotFound") {
+				return yield* new EntryNotFoundError({ sessionId: input.sessionId, entryId: input.entryId });
+			}
+			if (result._tag === "invalidData") {
+				return yield* new InvalidEntryDataError({
+					entryId: input.entryId,
+					type: input.type,
+					reason: result.reason,
+				});
+			}
+		});
+
+		const finalizeAssistant = Effect.fn("Session.finalizeAssistant")(function* (input: FinalizeAssistant) {
+			for (const [index, part] of input.parts.entries()) {
+				yield* decodeJsonObject(part.data).pipe(
+					Effect.mapError(
+						(error) =>
+							new InvalidEntryDataError({
+								entryId: input.entryId,
+								type: "assistant",
+								reason: `part ${index} ("${part.type}") is not a JSON object: ${error.message}`,
+							}),
+					),
+				);
+			}
+			const identity = yield* decodeMessageEnvelopeIdentity(input.data).pipe(
+				Effect.mapError(
+					(error) =>
+						new InvalidEntryDataError({ entryId: input.entryId, type: "assistant", reason: error.message }),
+				),
+			);
+			if (identity.messageId !== input.entryId) {
+				return yield* new InvalidEntryDataError({
+					entryId: input.entryId,
+					type: "assistant",
+					reason: `messageId "${identity.messageId}" does not match entry id`,
+				});
+			}
+			const usage = yield* decodeEnvelopeUsage(input.data).pipe(
+				Effect.map((envelope) => envelope.usage),
+				Effect.mapError(
+					(error) =>
+						new InvalidEntryDataError({ entryId: input.entryId, type: "assistant", reason: error.message }),
+				),
+			);
+
+			const result: PartTxResult = yield* sql
+				.withTransaction(
+					Effect.gen(function* () {
+						const owner = yield* findEntry(input.entryId);
+						if (Option.isNone(owner) || owner.value.sessionId !== input.sessionId) {
+							return { _tag: "entryNotFound" } as const;
+						}
+						if (owner.value.type !== "assistant") {
+							return {
+								_tag: "invalidData",
+								reason: `entry type "${owner.value.type}" is not an assistant`,
+							} as const;
+						}
+						// Byte-identical redelivery is a re-projection, not a rewrite.
+						if (owner.value.data === input.data) return { _tag: "written" } as const;
+
+						const state = yield* decodeEnvelopeState(owner.value.data).pipe(Effect.result);
+						if (Result.isFailure(state)) {
+							return { _tag: "invalidData", reason: state.failure.message } as const;
+						}
+						if (state.success.stopReason !== "aborted") {
+							return {
+								_tag: "invalidData",
+								reason: `assistant is already final with stopReason "${state.success.stopReason}"`,
+							} as const;
+						}
+
+						/*
+						 * Charge the difference, not the total.
+						 *
+						 * `stopReason` cannot tell a placeholder from a finalized abort --
+						 * `LLMFailed(aborted)` writes the same value the entry was created
+						 * with -- so the guard above lets a second aborted terminal through,
+						 * and inferring finality is not a thing this schema can do. Charging
+						 * a delta makes that harmless: the aggregate lands on the stored
+						 * envelope's usage however many times finalization runs, which is
+						 * the invariant the guard was standing in for.
+						 */
+						const charged = yield* decodeEnvelopeUsage(owner.value.data).pipe(
+							Effect.map((envelope) => envelope.usage),
+							Effect.orElseSucceed(() => zeroUsage),
+						);
+
+						const now = yield* epochNow;
+						yield* sql`
+							UPDATE session_entry SET data = ${input.data}, updated_at = ${now}
+							WHERE id = ${input.entryId}
+						`;
+						/*
+						 * Delete before writing, not after. The terminal message is the
+						 * authoritative array, so anything past its end is a block this
+						 * response no longer claims -- and `session_entry_part` carries a
+						 * second unique index on `(entry_id, call_id)` that the upsert's
+						 * conflict target does not cover. Writing first would let a call
+						 * that moved position collide with its own surviving row.
+						 */
+						yield* sql`
+							DELETE FROM session_entry_part
+							WHERE entry_id = ${input.entryId} AND part_index >= ${input.parts.length}
+						`;
+						for (const [partIndex, part] of input.parts.entries()) {
+							yield* writePart({ ...part, sessionId: input.sessionId, entryId: input.entryId, partIndex });
+						}
+						yield* sql`
+							UPDATE session SET
+								updated_at = ${now},
+								cost = cost + ${usage.cost.total - charged.cost.total},
+								tokens_input = tokens_input + ${usage.input - charged.input},
+								tokens_output = tokens_output + ${usage.output - charged.output},
+								tokens_cache_read = tokens_cache_read + ${usage.cacheRead - charged.cacheRead},
+								tokens_cache_write = tokens_cache_write + ${usage.cacheWrite - charged.cacheWrite}
+							WHERE id = ${input.sessionId}
+						`;
+						return { _tag: "written" } as const;
+					}),
+				)
+				.pipe(Effect.orDie);
+
+			if (result._tag === "entryNotFound") {
+				return yield* new EntryNotFoundError({ sessionId: input.sessionId, entryId: input.entryId });
+			}
+			if (result._tag === "invalidData") {
+				return yield* new InvalidEntryDataError({
+					entryId: input.entryId,
+					type: "assistant",
+					reason: result.reason,
+				});
+			}
+		});
+
+		/*
+		 * Both tool-call transitions write the same two columns at the same
+		 * address, so they are one statement with a different status rather than
+		 * two near-identical ones free to drift. The transition guard, ownership
+		 * check, and conflict rollback belong to the settlement-conflict work, not
+		 * here.
+		 */
+		type MoveTxResult =
+			| { readonly _tag: "notFound" }
+			| { readonly _tag: "conflict"; readonly reason: string }
+			| { readonly _tag: "moved" };
+
+		/**
+		 * Both tool-call transitions write the same two columns at the same address,
+		 * so they are one statement with a different target status.
+		 *
+		 * What it validates before writing, and why each matters:
+		 *
+		 * - **ownership** — the part must belong to the session being written on
+		 *   behalf of. Nothing constructs a cross-session write today; the check
+		 *   exists so that if something ever does, it fails here rather than
+		 *   silently settling a stranger's call.
+		 * - **continuity** — the tool name must still be the one the call was
+		 *   finalized with. A mismatch means two different calls are being treated
+		 *   as one.
+		 * - **the transition itself** — a settled call has left the lifecycle, and
+		 *   letting a late event write over it would make the terminal a matter of
+		 *   arrival order.
+		 *
+		 * Exact replay is explicitly not a conflict. Durable events can project more
+		 * than once, and an identical write is what idempotence looks like.
+		 */
+		const moveToolCall = Effect.fnUntraced(function* (input: {
+			readonly sessionId: SessionSchema.ID;
+			readonly entryId: string;
+			readonly callId: string;
+			readonly toolName: string;
+			readonly status: ToolStatus;
+			readonly data: string;
+			readonly from: ReadonlySet<ToolStatus>;
+		}) {
+			const result: MoveTxResult = yield* sql
 				.withTransaction(
 					Effect.gen(function* () {
 						const rows = yield* sql`
-							SELECT id FROM session_entry_part
+							SELECT session_id, status, tool_name, data FROM session_entry_part
 							WHERE entry_id = ${input.entryId} AND call_id = ${input.callId} AND type = 'toolCall'
 						`;
-						if (rows.length === 0) return false;
+						// The client maps result names to camelCase (`db/db.ts:37`).
+						const row = rows[0] as
+							| { sessionId: string; status: string; toolName: string | null; data: string }
+							| undefined;
+						if (row === undefined) return { _tag: "notFound" } as const;
+
+						if (row.sessionId !== input.sessionId) {
+							return {
+								_tag: "conflict",
+								reason: `call belongs to session "${row.sessionId}", not "${input.sessionId}"`,
+							} as const;
+						}
+						if (row.toolName !== null && row.toolName !== input.toolName) {
+							return {
+								_tag: "conflict",
+								reason: `call was finalized as "${row.toolName}" and is being settled as "${input.toolName}"`,
+							} as const;
+						}
+						if (!input.from.has(row.status as ToolStatus)) {
+							// The same write arriving twice is a re-projection, not a race.
+							if (row.status === input.status && row.data === input.data) {
+								return { _tag: "moved" } as const;
+							}
+							return {
+								_tag: "conflict",
+								reason: `call is "${row.status}" and cannot move to "${input.status}"`,
+							} as const;
+						}
+
 						const now = yield* epochNow;
 						yield* sql`
 							UPDATE session_entry_part
 							SET data = ${input.data}, status = ${input.status}, updated_at = ${now}
 							WHERE entry_id = ${input.entryId} AND call_id = ${input.callId} AND type = 'toolCall'
 						`;
-						return true;
+						return { _tag: "moved" } as const;
 					}),
 				)
 				.pipe(Effect.orDie);
 
-			if (!settled) {
+			if (result._tag === "notFound") {
 				return yield* new ToolCallNotFoundError({ entryId: input.entryId, callId: input.callId });
 			}
+			if (result._tag === "conflict") {
+				return yield* new ToolCallConflictError({
+					entryId: input.entryId,
+					callId: input.callId,
+					reason: result.reason,
+				});
+			}
+		});
+
+		const pendingOnly: ReadonlySet<ToolStatus> = new Set(["pending"]);
+		const unsettledOnly: ReadonlySet<ToolStatus> = new Set(["pending", "running"]);
+
+		const beginToolCall = Effect.fn("Session.beginToolCall")(function* (input: BeginToolCall) {
+			yield* moveToolCall({ ...input, status: "running", from: pendingOnly });
+		});
+
+		/*
+		 * `pending` is accepted as well as `running`: recovery settles calls that
+		 * never started, and the interrupted-batch finalizer settles calls that were
+		 * never admitted. Both are legitimate `pending -> terminal` moves.
+		 */
+		const settleToolCall = Effect.fn("Session.settleToolCall")(function* (input: SettleToolCall) {
+			yield* moveToolCall({ ...input, from: unsettledOnly });
 		});
 
 		type ForkTxResult =
@@ -904,7 +1360,12 @@ export const layer = Layer.effect(
 			path,
 			timeline,
 			unsettled,
+			latestAssistant,
+			toolCalls,
 			append,
+			upsertPart,
+			finalizeAssistant,
+			beginToolCall,
 			settleToolCall,
 			fork,
 			branch,

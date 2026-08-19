@@ -60,8 +60,25 @@ export interface ToolDef<
 	/**
 	 * A short one-line summary for compact tool listings (e.g. a system-prompt tool index),
 	 * distinct from the fuller `description`.
+	 *
+	 * A tool without one is still callable — it is simply absent from the rendered
+	 * index, which is how a tool opts out of spending prompt budget.
 	 */
 	readonly promptSnippet?: string;
+	/**
+	 * Guidance this tool contributes to the prompt's shared guidelines section,
+	 * as opposed to its own `description`.
+	 *
+	 * Use it for advice that only makes sense across tools — "prefer the search
+	 * tool over shelling out to grep" reads as noise inside one tool's
+	 * description and as policy in a guidelines list. Call-time semantics
+	 * (arguments, truncation, exit codes) belong in `description`, which the
+	 * provider caches with the tool definition.
+	 *
+	 * The builder normalizes whitespace, drops empties, and deduplicates while
+	 * keeping first occurrence in effective registry order.
+	 */
+	readonly promptGuidelines?: ReadonlyArray<string>;
 	readonly parameters: Params;
 	readonly success: Success;
 	/** Declared, model-visible failures (typed). Omit for tools that cannot fail expectedly. */
@@ -109,6 +126,7 @@ interface DefineInput<
 	readonly description: string;
 	readonly label?: string;
 	readonly promptSnippet?: string;
+	readonly promptGuidelines?: ReadonlyArray<string>;
 	readonly parameters: Params;
 	readonly success: Success;
 	readonly failure?: Failure;
