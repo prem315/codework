@@ -248,6 +248,26 @@ export const LLMFailed = EventSchema.define({
 });
 export type LLMFailed = typeof LLMFailed.Type;
 
+/**
+ * Durable: a turn ended without finishing.
+ *
+ * §7.5 deferred this on the grounds that a turn which reached the provider and
+ * failed is already durable as `LLMFailed`. That argument does not cover the
+ * case this exists for: a turn whose provider step *succeeded* and whose own
+ * execution then failed — a tool raising, a decode failing — leaving an entry
+ * the terminal deliberately left `draft` with nothing to close it.
+ *
+ * It names no message. A turn that failed before creating an entry has none, and
+ * a session has at most one draft, so its projector closes whatever it finds and
+ * does nothing when there is nothing.
+ */
+export const TurnFailed = EventSchema.define({
+	type: "session.turn.failed",
+	...durableOptions,
+	schema: { ...TurnFields, reason: Schema.String },
+});
+export type TurnFailed = typeof TurnFailed.Type;
+
 /*
  * Tool execution: the harness's own record of what it did, as distinct from
  * what the provider said. `LLMToolCallFinalized` means the model finished
@@ -300,6 +320,26 @@ export const ToolExecutionEnded = EventSchema.define({
 	schema: { ...ToolExecutionFields, part: EventSchema.AikitToolCallTerminalPart },
 });
 export type ToolExecutionEnded = typeof ToolExecutionEnded.Type;
+
+/**
+ * Durable: the exchange stopped because the model asked for too many turns in
+ * a row.
+ *
+ * A policy limit doing its job, not a fault — the drain settles normally and the
+ * session is left idle and valid. It is durable because "why did this stop"
+ * cannot be reconstructed from the turns themselves, which all look ordinary.
+ */
+export const ExchangeHalted = EventSchema.define({
+	type: "session.exchange.halted",
+	...durableOptions,
+	schema: {
+		...baseOptions,
+		/** The synthetic entry written so the model learns of the halt too. */
+		entryId: Schema.String,
+		continuations: PositiveInt,
+	},
+});
+export type ExchangeHalted = typeof ExchangeHalted.Type;
 
 /**
  * Durable: an unresolved call settled without ever producing an executor
@@ -366,6 +406,7 @@ export const DurableDefinitions = EventSchema.inventory(
 	Prompted,
 	SessionForked,
 	TurnEnded,
+	TurnFailed,
 	LLMStarted,
 	LLMTextEnd,
 	LLMThinkingEnd,
@@ -375,6 +416,7 @@ export const DurableDefinitions = EventSchema.inventory(
 	ToolExecutionStarted,
 	ToolExecutionEnded,
 	ToolFailed,
+	ExchangeHalted,
 );
 
 export * as EventList from "./list.ts";

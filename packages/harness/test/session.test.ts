@@ -559,6 +559,101 @@ describe("session", () => {
 		}),
 	);
 
+	it.effect("finalizing survives a tool call whose position moved", () =>
+		Effect.gen(function* () {
+			const session = yield* Session.Service;
+			const created = yield* createSession("s-part-moved");
+			yield* session.append(userEntry(created.id, "e1", "hi"));
+			yield* session.append({ ...assistantEntry(created.id, "e2"), state: "draft" });
+
+			const call = (partIndex: number) =>
+				session.upsertPart({
+					sessionId: created.id,
+					entryId: "e2",
+					partIndex,
+					type: "toolCall",
+					status: "pending",
+					callId: "call_1",
+					toolName: "read",
+					data: JSON.stringify({
+						type: "toolCall",
+						callID: "call_1",
+						name: "read",
+						arguments: {},
+						status: "pending",
+						time: { start: 1, end: 1 },
+					}),
+				});
+
+			// The block completion wrote it at index 1, where aikit announced it.
+			yield* call(1);
+
+			/*
+			 * The terminal's array puts it at 0. `session_entry_part` has two unique
+			 * indexes and an upsert can only name one, so writing over the old rows
+			 * used to collide on `(entry_id, call_id)` — killing the terminal
+			 * transaction permanently, every time. `call_id` is the identity; the
+			 * index is only where it sits.
+			 */
+			yield* session.finalizeAssistant({
+				sessionId: created.id,
+				entryId: "e2",
+				state: "committed",
+				data: JSON.stringify({
+					messageId: "e2",
+					role: "assistant",
+					usage: {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+				}),
+				parts: [
+					{
+						type: "toolCall",
+						status: "pending",
+						callId: "call_1",
+						toolName: "read",
+						data: JSON.stringify({
+							type: "toolCall",
+							callID: "call_1",
+							name: "read",
+							arguments: {},
+							status: "pending",
+							time: { start: 1, end: 1 },
+						}),
+					},
+				],
+			});
+
+			const entry = Option.getOrThrow(yield* session.entry("e2"));
+			expect(entry.parts).toHaveLength(1);
+			expect(entry.parts[0]!.partIndex).toBe(0);
+			expect(Option.getOrNull(entry.parts[0]!.callId)).toBe("call_1");
+		}),
+	);
+
+	it.effect("fork refuses a path carrying an unfinished draft", () =>
+		Effect.gen(function* () {
+			const session = yield* Session.Service;
+			const created = yield* createSession("s-fork-draft");
+			yield* session.append(userEntry(created.id, "e1", "hi"));
+			yield* session.append({ ...assistantEntry(created.id, "e2"), state: "draft" });
+
+			/*
+			 * An active session is refused a level above this. A *killed* one is not
+			 * active, and still has a draft — copying it would hand the new session
+			 * an unfinished turn whose calls belong to another session's history.
+			 */
+			const failure = yield* session.fork({ sessionId: created.id, slug: "s-fork-draft-copy" }).pipe(Effect.flip);
+			expect(failure._tag).toBe("InvalidEntryDataError");
+			if (failure._tag === "InvalidEntryDataError") expect(failure.reason).toContain("draft");
+		}),
+	);
+
 	it.effect("settleToolCall rejects a transition out of a state the call has left", () =>
 		Effect.gen(function* () {
 			const session = yield* Session.Service;
@@ -584,12 +679,15 @@ describe("session", () => {
 
 			yield* settle("completed", "first");
 
-			// Replaying the identical write is how idempotence looks — a durable
-			// event can be projected more than once.
-			yield* settle("completed", "first");
+			/*
+			 * Any second settlement is a conflict, identical or not. The commit path
+			 * rejects a repeated event id before projectors run, and nothing publishes
+			 * the same logical event twice — so a duplicate here means an assumption
+			 * broke, and it should say so rather than be absorbed.
+			 */
+			const replay = yield* settle("completed", "first").pipe(Effect.flip);
+			expect(replay._tag).toBe("ToolCallConflictError");
 
-			// A different value over a settled call is not. Letting it through would
-			// make the terminal a matter of arrival order.
 			const conflict = yield* settle("error", "second").pipe(Effect.flip);
 			expect(conflict._tag).toBe("ToolCallConflictError");
 			if (conflict._tag !== "ToolCallConflictError") return;

@@ -28,6 +28,16 @@ export interface Interface {
 	readonly latestAssistant: (
 		sessionId: SessionSchema.ID,
 	) => Effect.Effect<Option.Option<Message.AssistantMessage>, ContextReadError>;
+	/**
+	 * The session's unfinished assistant, decoded.
+	 *
+	 * Only the recovery sweep wants this, and only a hard kill produces one: a
+	 * turn that reached any terminal settles its own draft. `None` is the answer
+	 * on every drain that follows a clean turn.
+	 */
+	readonly currentDraft: (
+		sessionId: SessionSchema.ID,
+	) => Effect.Effect<Option.Option<Message.AssistantMessage>, ContextReadError>;
 }
 
 export class Service extends Context.Service<Service, Interface>()("@codeworksh/harness/context/context/Service") {}
@@ -53,7 +63,17 @@ export const layer = Layer.effect(
 			return Option.some(message);
 		});
 
-		return Service.of({ assemble, latestAssistant });
+		const currentDraft = Effect.fn("Context.currentDraft")(function* (sessionId: SessionSchema.ID) {
+			const found = yield* sessions.latestDraft(sessionId);
+			if (Option.isNone(found)) return Option.none<Message.AssistantMessage>();
+			const message = yield* decodeMessage(found.value);
+			if (message.role !== "assistant") {
+				return yield* Effect.die(`entry ${found.value.entry.id} is a draft but decodes as ${message.role}`);
+			}
+			return Option.some(message);
+		});
+
+		return Service.of({ assemble, latestAssistant, currentDraft });
 	}),
 );
 

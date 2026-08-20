@@ -251,8 +251,18 @@ describe("runner cycle — OpenAI live", () => {
 					expect(aborted.stopReason).toBe("aborted");
 					expect(abortedText.length).toBeGreaterThan(0);
 
+					/*
+					 * Two facts, at two scopes: the request failed, and the turn did not
+					 * finish. Every unsuccessful turn records the second regardless of
+					 * why, which is what makes "turns attempted" countable — here the
+					 * entry was already settled by the terminal, so the turn event closes
+					 * nothing and exists only to say so.
+					 */
 					const eventTypes = yield* eventTypesFor(sql)(session.id);
-					expect(eventTypes.at(-1)?.type).toBe("session.llm.failed.1");
+					expect(eventTypes.slice(-2).map((row) => row.type)).toEqual([
+						"session.llm.failed.1",
+						"session.turn.failed.1",
+					]);
 					yield* Effect.logInfo("live interrupted response", {
 						turn: 6,
 						user: storyPrompt,

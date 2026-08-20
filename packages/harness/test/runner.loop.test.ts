@@ -602,6 +602,12 @@ describe("runner loop — recovery sweep", () => {
 			expect(Option.getOrNull(path[0]!.parts[0]!.status)).toBe("skipped");
 			expect(JSON.stringify(settled.result.content)).toContain("never executed");
 
+			// The draft is closed, not left behind. Before `status` existed, a killed
+			// entry stayed indistinguishable from a settled one forever, so every
+			// later drain re-read it and re-scanned its calls to find nothing.
+			expect(path[0]!.entry.state).toBe("aborted");
+			expect(Option.isNone(yield* sessions.latestDraft(sessionId))).toBe(true);
+
 			// The sweep runs once per drain, before both loops: the failure is
 			// durable ahead of the prompt this drain came to deliver.
 			const durable = (yield* logFor(sql)(sessionId)).map((row) => row.type);
@@ -1127,6 +1133,47 @@ describe("runner loop — interruption during a tool batch", () => {
 	);
 
 	testEffect(layer).live(
+		"closes the turn on the spot rather than leaving it for the next drain",
+		Effect.gen(function* () {
+			started.length = 0;
+			const sql = yield* SqlClient.SqlClient;
+			const execution = yield* RunnerExecution.Service;
+			const events = yield* Event.Service;
+			const sessions = yield* Session.Service;
+			const sessionId = yield* seedSession("interrupt-closes");
+			yield* admit({ id: "msg_interrupt_closes", sessionId, delivery: "steer" });
+
+			const running = yield* Deferred.make<void>();
+			yield* events.listen((event) =>
+				event.type === "session.tool.execution.updated"
+					? Deferred.succeed(running, undefined).pipe(Effect.asVoid)
+					: Effect.void,
+			);
+			const waiting = yield* execution.resume(sessionId).pipe(Effect.forkChild);
+			yield* Deferred.await(running);
+			yield* execution.interrupt(sessionId);
+			yield* Fiber.await(waiting);
+
+			/*
+			 * `TurnEnded` commits an entry the terminal left `draft`, and an interrupt
+			 * lands between the two — so without a close on the failure path the entry
+			 * would sit unfinished until the next drain's sweep, which is the path
+			 * meant for hard kills.
+			 */
+			const durable = (yield* logFor(sql)(sessionId)).map((row) => row.type);
+			expect(durable).toContain("session.turn.failed.1");
+			expect(Option.isNone(yield* sessions.latestDraft(sessionId))).toBe(true);
+
+			// The response completed; only its tools were cut short. That turn earned
+			// its commit.
+			const path = yield* sessions.path(sessionId);
+			expect(path[1]!.entry.state).toBe("committed");
+			expect(yield* sessions.unsettled(sessionId)).toEqual([]);
+		}),
+		{ timeout: 10_000 },
+	);
+
+	testEffect(layer).live(
 		"commits the running call as aborted with its last partial, and skips the queued one",
 		Effect.gen(function* () {
 			started.length = 0;
@@ -1253,16 +1300,22 @@ describe("runner loop — terminals other than the happy path", () => {
 	});
 
 	testEffect(runtimeFor(endingWith("length", "ended", "error", 1))).effect(
-		"skips the calls of a truncated response rather than running them",
+		"skips a truncated response's calls, tells the model to re-issue them, and continues",
 		Effect.gen(function* () {
 			const { parts, path, unsettled } = yield* settledCalls("length", false);
 			// Truncated arguments can still parse and validate while meaning
 			// something else, so none of them is safe to execute.
 			expect(parts[0]?.status).toBe("skipped");
-			expect(JSON.stringify(parts[0]?.result.content)).toContain("output limit");
-			// `pwd` never ran, and the turn settled rather than continuing.
 			expect(JSON.stringify(parts[0]?.result.content)).not.toContain("/repo");
-			expect(path.map((item) => item.entry.type)).toEqual(["user", "assistant"]);
+
+			/*
+			 * `stopReason` never reaches a provider — only text, thinking, and
+			 * tool-call parts do. This result is the only channel through which the
+			 * model can learn its response was truncated, so it has to say what to do
+			 * about it, and the turn has to continue for that to be actionable.
+			 */
+			expect(JSON.stringify(parts[0]?.result.content)).toContain("Re-issue the tool call");
+			expect(path.map((item) => item.entry.type)).toEqual(["user", "assistant", "assistant"]);
 			expect(unsettled).toEqual([]);
 		}),
 	);
@@ -1652,6 +1705,176 @@ describe("runner loop — a failing prompt override never reaches the provider",
 			expect(requests).toBe(0);
 			// State is captured before the prompt is promoted, so nothing was written.
 			expect(yield* sessions.path(sessionId)).toEqual([]);
+		}),
+	);
+});
+
+describe("runner loop — a turn is not over until its tools are", () => {
+	const call = {
+		type: "toolCall",
+		callID: "call_unfinished",
+		name: "bash",
+		arguments: { command: "pwd" },
+		status: "pending",
+		time: { start: 1, end: 1 },
+	} as const satisfies Message.ToolCallPendingPart;
+
+	const { effect: it } = testEffect(runtime({}));
+
+	/** What a kill between the terminal and the tool batch leaves behind. */
+	const terminatedButUnrun = Effect.fnUntraced(function* (sessionId: SessionSchema.ID) {
+		const events = yield* Event.Service;
+		const messageId = SessionMessageSchema.ID.make("assistant_unrun");
+		const envelope = Message.createAssistantMessage({
+			messageId,
+			role: "assistant",
+			protocol: "openai",
+			provider: { id: "openai", name: "openai", source: "custom", env: [] },
+			model: "gpt-5.5",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "aborted",
+			time: { created: 1, completed: 1 },
+			parts: [],
+		});
+		yield* events.publish(EventList.LLMStarted, {
+			sessionId,
+			timestamp: DateTime.makeUnsafe(0),
+			messageId,
+			message: envelope,
+		});
+		yield* events.publish(EventList.LLMToolCallFinalized, {
+			sessionId,
+			timestamp: DateTime.makeUnsafe(0),
+			messageId,
+			partIndex: 0,
+			callId: call.callID,
+			toolName: call.name,
+			part: call,
+		});
+		// The terminal arrived. The batch never got to run — this is where the
+		// process died.
+		yield* events.publish(EventList.LLMEnded, {
+			sessionId,
+			timestamp: DateTime.makeUnsafe(0),
+			messageId,
+			reason: "toolUse",
+			message: { ...envelope, stopReason: "toolUse", parts: [call] },
+		});
+		return messageId;
+	});
+
+	it(
+		"leaves a toolUse terminal draft, so a kill before the batch is still recoverable",
+		Effect.gen(function* () {
+			const execution = yield* RunnerExecution.Service;
+			const sessions = yield* Session.Service;
+			const sessionId = yield* seedSession("unrun");
+			const messageId = yield* terminatedButUnrun(sessionId);
+
+			/*
+			 * The turn is one assistant response *plus its tool calls and results*,
+			 * so a response holding unrun calls has not finished it. Calling this
+			 * `committed` was the earlier behaviour, and it made the sweep — which
+			 * looks for drafts — blind to exactly this kill.
+			 */
+			expect(Option.isSome(yield* sessions.latestDraft(sessionId))).toBe(true);
+			const before = yield* sessions.entry(messageId);
+			expect(Option.isSome(before) && before.value.entry.state).toBe("draft");
+
+			yield* admit({ id: "msg_after_unrun", sessionId, delivery: "steer" });
+			yield* execution.resume(sessionId);
+
+			// The sweep found it, settled the call, and committed the turn — the
+			// response did complete, only its tools were cut short.
+			const settled = JSON.parse(
+				(yield* sessions.path(sessionId))[0]!.parts[0]!.data,
+			) as Message.ToolCallTerminalPart;
+			expect(settled.status).toBe("skipped");
+			expect(yield* sessions.unsettled(sessionId)).toEqual([]);
+			const after = yield* sessions.entry(messageId);
+			expect(Option.isSome(after) && after.value.entry.state).toBe("committed");
+		}),
+	);
+});
+
+describe("runner loop — the continuation ceiling", () => {
+	/** Asks for a tool forever. */
+	const insatiable = (): LLM.Open => {
+		let responseIndex = 0;
+		return (input) =>
+			Effect.sync(() => {
+				responseIndex += 1;
+				const part = {
+					type: "toolCall",
+					callID: `call_${responseIndex}`,
+					name: "bash",
+					arguments: { command: "pwd" },
+					status: "pending",
+					time: { start: responseIndex, end: responseIndex },
+				} as const satisfies Message.ToolCallPendingPart;
+				const message = assistant(input, responseIndex, { stopReason: "toolUse", parts: [part] });
+				const events = createAssistantMessageEventStream();
+				events.push({ type: "start", partial: message });
+				events.push({ type: "toolcall.final", partIndex: 0, toolCall: part, partial: message });
+				events.push({ type: "done", reason: "toolUse", message });
+				return events;
+			});
+	};
+
+	const database = Database.layer(":memory:");
+	const request = LLM.make(insatiable());
+	const sandbox = SandboxController.layer().pipe(Layer.provide(SandboxDriver.layer(fake.driver)));
+	const layer = Control.layer.pipe(
+		Layer.provideMerge(
+			RunnerExecute.layer.pipe(
+				Layer.provide(Loop.layer({ request }).pipe(Layer.provide(State.layer({ maxContinuations: 3 })))),
+			),
+		),
+		Layer.provideMerge(Context.layer),
+		Layer.provideMerge(SessionProjector.layer),
+		Layer.provideMerge(Session.layer),
+		Layer.provideMerge(Event.layer),
+		Layer.provideMerge(sandbox),
+		Layer.provideMerge(database),
+	);
+
+	testEffect(layer).effect(
+		"stops a model that will not stop, and leaves a record the model can read",
+		Effect.gen(function* () {
+			const sql = yield* SqlClient.SqlClient;
+			const execution = yield* RunnerExecution.Service;
+			const sessions = yield* Session.Service;
+			const context = yield* Context.Service;
+			const sessionId = yield* seedSession("insatiable");
+			yield* admit({ id: "msg_insatiable", sessionId, delivery: "steer" });
+
+			// Ends normally: a policy limit tripping is the limit working, and a
+			// failure here would read as a defect everywhere it was logged.
+			yield* execution.resume(sessionId);
+
+			const path = yield* sessions.path(sessionId);
+			expect(path.filter((item) => item.entry.type === "assistant")).toHaveLength(3);
+			expect(path.at(-1)!.entry.type).toBe("synthetic");
+
+			const durable = (yield* logFor(sql)(sessionId)).map((row) => row.type);
+			expect(durable.filter((type) => type === "session.exchange.halted.1")).toHaveLength(1);
+
+			/*
+			 * Nothing about a halt reaches a provider on its own, so the synthetic
+			 * entry is the only way the model learns the exchange was cut short
+			 * rather than simply ending.
+			 */
+			const assembled = yield* context.assemble(sessionId);
+			const last = assembled.messages.at(-1);
+			expect(last?.role).toBe("user");
+			expect(JSON.stringify(last?.parts)).toContain("Stopped after 3 consecutive turns");
 		}),
 	);
 });

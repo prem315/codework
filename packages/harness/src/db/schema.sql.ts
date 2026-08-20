@@ -35,6 +35,24 @@ export type MessageEntryType = (typeof messageEntryTypes)[number];
 
 // Part discriminant: aikit wire literals, verbatim — the column value always
 // equals json_extract(data, '$.type').
+/**
+ * Settlement state of one entry, as distinct from what a provider reported.
+ *
+ * `draft` means the entry is still being written — only an assistant response
+ * being assembled from a live stream is ever draft, and every other entry type
+ * is `committed` the moment it is appended. The other three are how a draft
+ * settled, which is exactly the question `stopReason` cannot answer: a
+ * placeholder and an aborted terminal both carry `stopReason: "aborted"`, so
+ * finality has to live in its own column rather than be inferred from aikit's
+ * wire vocabulary.
+ *
+ * `stop`, `length`, and `toolUse` all settle as `committed`; which of them it
+ * was stays in the envelope's `stopReason`. This column answers "is it still
+ * being written, and if not, did it end badly" — indexed, without parsing JSON.
+ */
+export const entryStates = ["draft", "committed", "aborted", "error"] as const;
+export type EntryState = (typeof entryStates)[number];
+
 export const partTypes = ["text", "image", "thinking", "toolCall"] as const;
 export type PartType = (typeof partTypes)[number];
 
@@ -161,6 +179,11 @@ export class SessionEntryRow extends Model.Class<SessionEntryRow>("SessionEntryR
 	// which is why the fork seeds the new aggregate above them.
 	seq: NonNegativeInt,
 	type: Schema.Literals(entryTypes),
+	// Settlement state. Only a streamed assistant is ever `draft`; everything
+	// else is `committed` on append. Named `state`, not `status`, because
+	// `SessionEntryPartRow.status` is aikit's tool status and shares two of its
+	// values with different meanings.
+	state: Schema.Literals(entryStates),
 	data: Schema.String, // JSON: full payload, or message envelope
 	label: Model.FieldOption(Schema.String), // annotation: bookmark text
 	metadata: Model.FieldOption(Model.JsonFromString(Metadata)), // annotation: engine scratch

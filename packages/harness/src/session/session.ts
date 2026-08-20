@@ -3,6 +3,8 @@ import { SqlClient, SqlSchema } from "effect/unstable/sql";
 import { uuidv7 } from "uuidv7";
 import { Database } from "../db/db.ts";
 import {
+	type EntryState,
+	entryStates,
 	type EntryType,
 	entryTypes,
 	type MessageEntryType,
@@ -22,6 +24,7 @@ import type { AbsolutePath } from "../schema.ts";
 import { SessionSchema } from "./schema.ts";
 
 export {
+	entryStates,
 	entryTypes,
 	messageEntryTypes,
 	partTypes,
@@ -29,6 +32,7 @@ export {
 	SessionEntryRow,
 	SessionRow,
 	toolStatuses,
+	type EntryState,
 	type EntryType,
 	type MessageEntryType,
 	type PartType,
@@ -101,6 +105,12 @@ export interface AppendPart {
 
 export interface AppendEntry {
 	readonly id: string; // uuidv7; == aikit messageId for message types
+	/**
+	 * Settlement state. Defaults to `committed`, which is right for every entry
+	 * that is complete when it is written — only a streamed assistant is created
+	 * `draft` and settled later.
+	 */
+	readonly state?: EntryState;
 	readonly sessionId: SessionSchema.ID;
 	/**
 	 * Position in the session's durable log — the sequence of the event that
@@ -154,6 +164,12 @@ export interface UpsertPart {
 export interface FinalizeAssistant {
 	readonly sessionId: SessionSchema.ID;
 	readonly entryId: string;
+	/**
+	 * Where the entry lands. Not always settled: a terminal that leaves tool
+	 * calls for the loop to run keeps it `draft`, because the turn is not over
+	 * until those results are in.
+	 */
+	readonly state: EntryState;
 	readonly data: string; // final aikit envelope JSON, without parts
 	readonly parts: ReadonlyArray<AppendPart>; // authoritative; order = partIndex
 }
@@ -239,6 +255,31 @@ export interface Interface {
 	 * is durable — true in every phase.
 	 */
 	readonly toolCalls: (entryId: string) => Effect.Effect<SessionEntryPartRow[]>;
+	/**
+	 * The session's unfinished assistant, if it has one.
+	 *
+	 * The recovery sweep's whole question, in one indexed lookup. A session whose
+	 * last turn finished cleanly answers `None` without reading an entry or
+	 * decoding a message — which is the common case, on every drain.
+	 */
+	readonly latestDraft: (sessionId: SessionSchema.ID) => Effect.Effect<Option.Option<HydratedEntry>>;
+	/**
+	 * Settle a draft without touching its envelope.
+	 *
+	 * What closes a turn once its tool results are in — the envelope was already
+	 * written by the terminal, and there is nothing new to say about it. Also how
+	 * the recovery sweep closes a draft no terminal will ever settle.
+	 *
+	 * `false` means the entry exists and was already settled, which is ordinary: a
+	 * terminal that left no tool work settles the entry itself. A *missing* entry
+	 * is not ordinary and fails, so the two cannot be confused by a caller that
+	 * ignores the first.
+	 */
+	readonly closeDraft: (input: {
+		readonly sessionId: SessionSchema.ID;
+		readonly entryId: string;
+		readonly state: Exclude<EntryState, "draft">;
+	}) => Effect.Effect<boolean, EntryNotFoundError>;
 	readonly append: (
 		input: AppendEntry,
 	) => Effect.Effect<SessionEntryRow, SessionNotFoundError | EntryNotFoundError | InvalidEntryDataError>;
@@ -277,17 +318,6 @@ const messageTypes: ReadonlySet<string> = new Set(messageEntryTypes);
 // Structural decode of the persisted envelope's usage; failures surface as
 // InvalidEntryDataError, never a defect — callers (Context Manager, UI) can act.
 const decodeEnvelopeUsage = Schema.decodeUnknownEffect(SessionSchema.AssistantEnvelopeUsage);
-const decodeEnvelopeState = Schema.decodeUnknownEffect(SessionSchema.AssistantEnvelopeState);
-
-/** What an entry has been charged for when its envelope carries no usage yet. */
-const zeroUsage: SessionSchema.Usage = {
-	input: 0,
-	output: 0,
-	cacheRead: 0,
-	cacheWrite: 0,
-	totalTokens: 0,
-	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-};
 const decodeMessageEnvelopeIdentity = Schema.decodeUnknownEffect(SessionSchema.MessageEnvelopeIdentity);
 const decodeCompactionData = Schema.decodeUnknownEffect(SessionSchema.CompactionData);
 const decodeJsonObject = Schema.decodeUnknownEffect(SessionSchema.JsonObject);
@@ -334,10 +364,10 @@ export const layer = Layer.effect(
 			Request: SessionEntryRow.insert,
 			Result: Schema.Struct({ id: Schema.String }),
 			execute: (row) => sql`
-				INSERT INTO session_entry (id, session_id, parent_id, seq, type, data, label, metadata, created_at, updated_at)
+				INSERT INTO session_entry (id, session_id, parent_id, seq, type, state, data, label, metadata, created_at, updated_at)
 				SELECT
 					${row.id}, ${row.sessionId}, ${row.parentId ?? null}, ${row.seq},
-					${row.type}, ${row.data}, ${row.label ?? null}, ${row.metadata ?? null},
+					${row.type}, ${row.state}, ${row.data}, ${row.label ?? null}, ${row.metadata ?? null},
 					${row.createdAt}, ${row.updatedAt}
 				WHERE NOT EXISTS (
 					SELECT 1 FROM session_entry WHERE session_id = ${row.sessionId} AND seq >= ${row.seq}
@@ -428,6 +458,18 @@ export const layer = Layer.effect(
 					JOIN path p ON e.id = p.parent_id AND e.session_id = p.session_id
 				)
 				SELECT * FROM path WHERE type = 'assistant' ORDER BY seq DESC LIMIT 1
+			`,
+		});
+
+		// Newest first: a session has at most one draft in practice, and taking the
+		// newest is the right answer if an older one was ever stranded.
+		const selectLatestDraft = SqlSchema.findOneOption({
+			Request: Schema.String,
+			Result: SessionEntryRow,
+			execute: (sessionId) => sql`
+				SELECT * FROM session_entry
+				WHERE session_id = ${sessionId} AND state = 'draft'
+				ORDER BY seq DESC LIMIT 1
 			`,
 		});
 
@@ -553,6 +595,48 @@ export const layer = Layer.effect(
 			return yield* selectToolCalls(entryId).pipe(Effect.orDie);
 		});
 
+		const latestDraft = Effect.fn("Session.latestDraft")(function* (sessionId: SessionSchema.ID) {
+			const found = yield* selectLatestDraft(sessionId).pipe(Effect.orDie);
+			if (Option.isNone(found)) return Option.none<HydratedEntry>();
+			const parts = yield* partsFor([found.value]);
+			return Option.some(hydrate([found.value], parts)[0]!);
+		});
+
+		/*
+		 * State only; the envelope is left exactly as it was. A turn closing after
+		 * its tools settled has nothing new to say about the message, and a killed
+		 * turn produced no terminal to say it with — inventing one would put words
+		 * in the provider's mouth.
+		 */
+		const closeDraft = Effect.fn("Session.closeDraft")(function* (input: {
+			readonly sessionId: SessionSchema.ID;
+			readonly entryId: string;
+			readonly state: Exclude<EntryState, "draft">;
+		}) {
+			const now = yield* epochNow;
+			return yield* sql
+				.withTransaction(
+					Effect.gen(function* () {
+						const owner = yield* findEntry(input.entryId);
+						if (Option.isNone(owner) || owner.value.sessionId !== input.sessionId) return undefined;
+						if (owner.value.state !== "draft") return false;
+						yield* sql`
+							UPDATE session_entry SET state = ${input.state}, updated_at = ${now}
+							WHERE id = ${input.entryId}
+						`;
+						return true;
+					}),
+				)
+				.pipe(
+					Effect.orDie,
+					Effect.flatMap((closed) =>
+						closed === undefined
+							? new EntryNotFoundError({ sessionId: input.sessionId, entryId: input.entryId })
+							: Effect.succeed(closed),
+					),
+				);
+		});
+
 		type AppendTxResult =
 			| { readonly _tag: "sessionNotFound" }
 			| { readonly _tag: "parentNotFound" }
@@ -669,6 +753,7 @@ export const layer = Layer.effect(
 							parentId,
 							seq: input.seq,
 							type: input.type,
+							state: input.state ?? "committed",
 							data: input.data,
 							label: Option.none(),
 							metadata: Option.fromUndefinedOr(input.metadata),
@@ -869,64 +954,52 @@ export const layer = Layer.effect(
 								reason: `entry type "${owner.value.type}" is not an assistant`,
 							} as const;
 						}
-						// Byte-identical redelivery is a re-projection, not a rewrite.
-						if (owner.value.data === input.data) return { _tag: "written" } as const;
-
-						const state = yield* decodeEnvelopeState(owner.value.data).pipe(Effect.result);
-						if (Result.isFailure(state)) {
-							return { _tag: "invalidData", reason: state.failure.message } as const;
-						}
-						if (state.success.stopReason !== "aborted") {
+						/*
+						 * One question, answerable. Finality used to be inferred from
+						 * `stopReason !== "aborted"`, which cannot work: a draft placeholder
+						 * and an aborted terminal write the same value, so an aborted turn
+						 * could be finalized twice and charged twice. `status` is the
+						 * harness's own vocabulary and says exactly this.
+						 */
+						if (owner.value.state !== "draft") {
 							return {
 								_tag: "invalidData",
-								reason: `assistant is already final with stopReason "${state.success.stopReason}"`,
+								reason: `assistant is already settled as "${owner.value.state}"`,
 							} as const;
 						}
 
-						/*
-						 * Charge the difference, not the total.
-						 *
-						 * `stopReason` cannot tell a placeholder from a finalized abort --
-						 * `LLMFailed(aborted)` writes the same value the entry was created
-						 * with -- so the guard above lets a second aborted terminal through,
-						 * and inferring finality is not a thing this schema can do. Charging
-						 * a delta makes that harmless: the aggregate lands on the stored
-						 * envelope's usage however many times finalization runs, which is
-						 * the invariant the guard was standing in for.
-						 */
-						const charged = yield* decodeEnvelopeUsage(owner.value.data).pipe(
-							Effect.map((envelope) => envelope.usage),
-							Effect.orElseSucceed(() => zeroUsage),
-						);
-
 						const now = yield* epochNow;
 						yield* sql`
-							UPDATE session_entry SET data = ${input.data}, updated_at = ${now}
+							UPDATE session_entry SET data = ${input.data}, state = ${input.state}, updated_at = ${now}
 							WHERE id = ${input.entryId}
 						`;
 						/*
-						 * Delete before writing, not after. The terminal message is the
-						 * authoritative array, so anything past its end is a block this
-						 * response no longer claims -- and `session_entry_part` carries a
-						 * second unique index on `(entry_id, call_id)` that the upsert's
-						 * conflict target does not cover. Writing first would let a call
-						 * that moved position collide with its own surviving row.
+						 * Replace the whole array rather than upsert over it.
+						 *
+						 * `session_entry_part` has two unique indexes — `(entry_id,
+						 * part_index)` and `(entry_id, call_id)` — and an upsert can only
+						 * name one conflict target. Writing over the old rows therefore
+						 * collided whenever a call's position moved: its own surviving row
+						 * still held the `call_id`, the insert hit the *other* index, and
+						 * the whole terminal transaction died, permanently and every time.
+						 *
+						 * `call_id` is the identity; the index is just where it sits. So
+						 * the safe write is one that cannot have a stale row to collide
+						 * with. This is reachable only at finalization, which happens once
+						 * and before any tool runs, so nothing settled is being discarded.
 						 */
-						yield* sql`
-							DELETE FROM session_entry_part
-							WHERE entry_id = ${input.entryId} AND part_index >= ${input.parts.length}
-						`;
+						yield* sql`DELETE FROM session_entry_part WHERE entry_id = ${input.entryId}`;
 						for (const [partIndex, part] of input.parts.entries()) {
 							yield* writePart({ ...part, sessionId: input.sessionId, entryId: input.entryId, partIndex });
 						}
 						yield* sql`
 							UPDATE session SET
 								updated_at = ${now},
-								cost = cost + ${usage.cost.total - charged.cost.total},
-								tokens_input = tokens_input + ${usage.input - charged.input},
-								tokens_output = tokens_output + ${usage.output - charged.output},
-								tokens_cache_read = tokens_cache_read + ${usage.cacheRead - charged.cacheRead},
-								tokens_cache_write = tokens_cache_write + ${usage.cacheWrite - charged.cacheWrite}
+								cost = cost + ${usage.cost.total},
+								tokens_input = tokens_input + ${usage.input},
+								tokens_output = tokens_output + ${usage.output},
+								tokens_cache_read = tokens_cache_read + ${usage.cacheRead},
+								tokens_cache_write = tokens_cache_write + ${usage.cacheWrite}
 							WHERE id = ${input.sessionId}
 						`;
 						return { _tag: "written" } as const;
@@ -975,8 +1048,10 @@ export const layer = Layer.effect(
 		 *   letting a late event write over it would make the terminal a matter of
 		 *   arrival order.
 		 *
-		 * Exact replay is explicitly not a conflict. Durable events can project more
-		 * than once, and an identical write is what idempotence looks like.
+		 * A duplicate is a conflict, not something to absorb. The commit path dies
+		 * on a repeated event id before any projector runs (`event/event.ts`), and
+		 * nothing publishes the same logical event twice — so a second identical
+		 * write means an assumption broke, and failing loudly beats swallowing it.
 		 */
 		const moveToolCall = Effect.fnUntraced(function* (input: {
 			readonly sessionId: SessionSchema.ID;
@@ -1013,10 +1088,6 @@ export const layer = Layer.effect(
 							} as const;
 						}
 						if (!input.from.has(row.status as ToolStatus)) {
-							// The same write arriving twice is a re-projection, not a race.
-							if (row.status === input.status && row.data === input.data) {
-								return { _tag: "moved" } as const;
-							}
 							return {
 								_tag: "conflict",
 								reason: `call is "${row.status}" and cannot move to "${input.status}"`,
@@ -1192,6 +1263,25 @@ export const layer = Layer.effect(
 						});
 						yield* insertSession(sessionRow);
 
+						/*
+						 * A draft is a turn still being written, or one a kill left behind
+						 * before the sweep reached it. Copying it would hand the new
+						 * session an unfinished turn whose calls belong to another
+						 * session's history — and whose sweep would then settle them
+						 * there. An active session is refused a level above this; a
+						 * *killed* one is not active, which is exactly the case that
+						 * needs the check to be structural.
+						 */
+						const draft = preparedEntries.find((prepared) => prepared.source.state === "draft");
+						if (draft !== undefined) {
+							return {
+								_tag: "invalidData",
+								entryId: draft.source.id,
+								type: draft.source.type,
+								reason: "cannot fork a path containing an unfinished draft",
+							} as const;
+						}
+
 						// Positions are carried over verbatim, not renumbered: they are log
 						// positions, and preserving them keeps the copy ordered exactly as
 						// the source. The new aggregate is then seeded above the highest of
@@ -1203,6 +1293,7 @@ export const layer = Layer.effect(
 								parentId: Option.map(prepared.source.parentId, (parent) => idMap.get(parent)!),
 								seq: prepared.source.seq,
 								type: prepared.source.type,
+								state: prepared.source.state,
 								data: prepared.data,
 								label: prepared.source.label, // annotations ride the copy (§10.12)
 								metadata: prepared.source.metadata,
@@ -1361,6 +1452,8 @@ export const layer = Layer.effect(
 			timeline,
 			unsettled,
 			latestAssistant,
+			latestDraft,
+			closeDraft,
 			toolCalls,
 			append,
 			upsertPart,

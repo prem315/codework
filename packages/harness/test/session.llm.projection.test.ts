@@ -246,12 +246,53 @@ describe("LLM terminal projection", () => {
 			expect(JSON.parse(entry!.entry.data)).toMatchObject({ stopReason: "aborted" });
 		}));
 
-	it("charges usage once even when the same aborted terminal is delivered twice", () =>
+	it("creates the entry as a draft and settles it at the terminal", () =>
 		Effect.gen(function* () {
-			const { events, sessionId } = yield* setup;
+			const { sessions, events, sessionId } = yield* setup;
+			yield* start(sessionId);
+
+			// A draft is the one entry type that is not complete when it is written.
+			expect((yield* sessions.path(sessionId))[0]!.entry.state).toBe("draft");
+
+			yield* events.publish(EventList.LLMEnded, {
+				sessionId,
+				messageId,
+				timestamp: DateTime.makeUnsafe(0),
+				reason: "stop",
+				message: assistant(),
+			});
+
+			// `stop`, `length`, and `toolUse` all commit; which it was stays in the
+			// envelope rather than being smeared across two vocabularies.
+			const [entry] = yield* sessions.path(sessionId);
+			expect(entry!.entry.state).toBe("committed");
+			expect(JSON.parse(entry!.entry.data)).toMatchObject({ stopReason: "stop" });
+		}));
+
+	it("settles a failed response as aborted or error, not as committed", () =>
+		Effect.gen(function* () {
+			const { sessions, events, sessionId } = yield* setup;
+			yield* start(sessionId);
+
+			yield* events.publish(EventList.LLMFailed, {
+				sessionId,
+				messageId,
+				timestamp: DateTime.makeUnsafe(0),
+				reason: "aborted",
+				message: assistant({ stopReason: "aborted", errorMessage: "interrupted" }),
+			});
+
+			// The column answers "did it end badly" without parsing the envelope,
+			// which `stopReason` alone could never do — a placeholder carries
+			// `aborted` too.
+			expect((yield* sessions.path(sessionId))[0]!.entry.state).toBe("aborted");
+		}));
+
+	it("rejects a second, different terminal on an already aborted entry", () =>
+		Effect.gen(function* () {
+			const { sessions, events, sessionId } = yield* setup;
 			yield* start(sessionId);
 			const failed = assistant({ stopReason: "aborted", errorMessage: "interrupted" });
-
 			yield* events.publish(EventList.LLMFailed, {
 				sessionId,
 				messageId,
@@ -259,25 +300,27 @@ describe("LLM terminal projection", () => {
 				reason: "aborted",
 				message: failed,
 			});
-			const charged = yield* usageTotals;
 
 			/*
-			 * An aborted terminal writes the same `stopReason` the placeholder holds,
-			 * so finality cannot be inferred from it. Redelivery is most likely on
-			 * exactly this path, which is where a double charge would land.
+			 * This is what `stopReason` could not catch. An aborted terminal writes
+			 * the same value the draft placeholder held, so finality was unanswerable
+			 * and a second terminal was accepted — and its usage charged again.
 			 */
-			yield* events.publish(EventList.LLMFailed, {
-				sessionId,
-				messageId,
-				timestamp: DateTime.makeUnsafe(1),
-				reason: "aborted",
-				message: failed,
-			});
-
-			expect(yield* usageTotals).toEqual(charged);
+			const second = yield* events
+				.publish(EventList.LLMEnded, {
+					sessionId,
+					messageId,
+					timestamp: DateTime.makeUnsafe(1),
+					reason: "stop",
+					message: assistant(),
+				})
+				.pipe(Effect.exit);
+			expect(Exit.isFailure(second)).toBe(true);
+			expect((yield* sessions.path(sessionId))[0]!.entry.state).toBe("aborted");
+			expect((yield* usageTotals).tokensInput).toBe(11);
 		}));
 
-	it("absorbs an identical redelivery and rejects a different second terminal", () =>
+	it("rejects any second finalization, identical or not", () =>
 		Effect.gen(function* () {
 			const { sessions, events, sessionId } = yield* setup;
 			yield* start(sessionId);
@@ -290,25 +333,21 @@ describe("LLM terminal projection", () => {
 			} as const;
 			yield* events.publish(EventList.LLMEnded, terminal);
 
-			// The same value arriving twice is a re-projection, not a rewrite — the
-			// same rule tool-call settlement follows.
-			yield* events.publish(EventList.LLMEnded, { ...terminal, timestamp: DateTime.makeUnsafe(1) });
+			/*
+			 * Not even an identical redelivery. The commit path rejects a repeated
+			 * event id before projectors run, and nothing publishes the same logical
+			 * event twice — so a second one means an assumption broke, and absorbing
+			 * it is how a double-charge would stay invisible.
+			 */
+			const replay = yield* events
+				.publish(EventList.LLMEnded, { ...terminal, timestamp: DateTime.makeUnsafe(1) })
+				.pipe(Effect.exit);
+			expect(Exit.isFailure(replay)).toBe(true);
+
+			// The rejection took the durable event with it: one entry, charged once.
 			expect((yield* usageTotals).tokensInput).toBe(11);
 			expect((yield* sessions.path(sessionId)).length).toBe(1);
-
-			// A *different* envelope over a final one is not. This is what the
-			// immutability rule is actually protecting.
-			const conflicting = yield* events
-				.publish(EventList.LLMEnded, {
-					...terminal,
-					timestamp: DateTime.makeUnsafe(2),
-					reason: "length",
-					message: assistant({ stopReason: "length" }),
-				})
-				.pipe(Effect.exit);
-			expect(conflicting._tag).toBe("Failure");
 			expect(JSON.parse((yield* sessions.path(sessionId))[0]!.entry.data)).toMatchObject({ stopReason: "stop" });
-			expect((yield* usageTotals).tokensInput).toBe(11);
 		}));
 
 	it("stores a failed response the same way, keeping what the model produced", () =>

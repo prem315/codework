@@ -28,14 +28,52 @@
  */
 
 import { Message } from "@codeworksh/aikit";
-import { DateTime, Effect, Layer, Option } from "effect";
+import { DateTime, Effect, Layer, Option, Schema } from "effect";
 import { ContextCodec } from "../context/codec.ts";
 import { Event } from "../event/event.ts";
 import { EventList } from "../event/list.ts";
 import { SessionInput } from "./input/input.ts";
-import type { SessionMessageSchema } from "./message/schema.ts";
+import { SessionMessageSchema } from "./message/schema.ts";
 import type { SessionSchema } from "./schema.ts";
 import { Session } from "./session.ts";
+
+/**
+ * How a terminal disposes of the calls it will not run, by what it reported.
+ *
+ * Absent means "leave them pending" — `toolUse` and `stop` both hand their calls
+ * to the loop. `length` is the interesting one: the output was cut off
+ * mid-generation, so arguments that still parse and validate may mean something
+ * else entirely, and none of them is safe to execute.
+ */
+const unrunnable: Partial<
+	Record<
+		Message.AssistantMessage["stopReason"],
+		{ readonly status: "skipped" | "aborted" | "error"; readonly error: string }
+	>
+> = {
+	/*
+	 * The wording carries the whole signal. `stopReason` is never sent to a
+	 * provider — only text, thinking, and tool-call parts are — so the model is
+	 * never told its last response was truncated. This tool result is the only
+	 * place it can learn that, and the only place it can be told what to do about
+	 * it. Pi's phrasing, for the same reason.
+	 */
+	length: {
+		status: "skipped",
+		error: "Tool call was not executed: the response hit the output token limit, so its arguments may be truncated. Re-issue the tool call with complete arguments.",
+	},
+	// Aborted is something we did; error is something the provider did. The
+	// distinction is what a reader of the settled part gets to see.
+	aborted: { status: "aborted", error: "Tool call was not executed: the response was aborted." },
+	error: { status: "error", error: "Tool call was not executed: the response failed." },
+};
+
+/** The synthetic envelope a halt writes, as the assembler will read it back. */
+const encodeHaltData = Schema.encodeEffect(
+	Schema.fromJsonString(
+		Schema.Struct({ messageId: Schema.String, customType: Schema.String, display: Schema.Boolean }),
+	),
+);
 
 export const layer = Layer.effectDiscard(
 	Effect.gen(function* () {
@@ -78,6 +116,10 @@ export const layer = Layer.effectDiscard(
 					id: input.messageId,
 					sessionId: input.sessionId,
 					seq: input.seq,
+					// The one entry type that is not complete when it is written. It
+					// stays `draft` until a terminal settles it, or until the recovery
+					// sweep abandons it.
+					state: "draft",
 					...encoded,
 					...(input.metadata === undefined ? {} : { metadata: input.metadata }),
 				})
@@ -98,11 +140,63 @@ export const layer = Layer.effectDiscard(
 		 * part is still `pending` and matches what aikit carries. It stops being a
 		 * no-op in Phase 2.
 		 */
+		/**
+		 * Terminal parts for calls that never ran, written from the stored call.
+		 *
+		 * No executor outcome exists for any of these, so the part is synthesized
+		 * here rather than handed over — the same construction `ToolFailed` uses,
+		 * which is why both go through this one function.
+		 */
+		const settleOpenCalls = Effect.fn("SessionProjector.settleOpenCalls")(function* (input: {
+			readonly sessionId: SessionSchema.ID;
+			readonly messageId: SessionMessageSchema.ID;
+			readonly status: "skipped" | "aborted" | "error";
+			readonly error: string;
+			/** Progress the harness saw before the call stopped, when it saw any. */
+			readonly partial?: Message.ToolCallRunningPart;
+			/** Restrict to one call; omitted settles every open call on the entry. */
+			readonly callId?: string;
+		}) {
+			const rows = yield* sessions.toolCalls(input.messageId);
+			for (const row of rows) {
+				const open = Option.getOrUndefined(row.status);
+				if (open !== "pending" && open !== "running") continue;
+				const callId = Option.getOrUndefined(row.callId);
+				const toolName = Option.getOrUndefined(row.toolName);
+				if (callId === undefined || toolName === undefined) continue;
+				if (input.callId !== undefined && callId !== input.callId) continue;
+
+				const base = yield* ContextCodec.decodeToolCallBase(row);
+				// A tool interrupted mid-run usually produced something first, and that
+				// is more useful to the model than the reason it stopped. Keep both.
+				const reported = input.partial?.partial?.content ?? [];
+				const settled: Message.ToolCallTerminalPart = {
+					...base,
+					status: input.status,
+					result: { content: [...reported, { type: "text", text: input.error }], isError: true },
+				};
+				const encoded = yield* ContextCodec.encodePart({
+					messageId: input.messageId,
+					role: "assistant",
+					part: settled,
+				});
+				yield* sessions.settleToolCall({
+					sessionId: input.sessionId,
+					entryId: input.messageId,
+					callId,
+					toolName,
+					status: input.status,
+					data: encoded.data,
+				});
+			}
+		});
+
 		const finalizeAssistant = Effect.fn("SessionProjector.finalizeAssistant")(function* (input: {
 			readonly sessionId: SessionSchema.ID;
 			readonly messageId: SessionMessageSchema.ID;
 			readonly message: Message.AssistantMessage;
 			readonly reason: Message.AssistantMessage["stopReason"];
+			readonly state: Session.EntryState;
 		}) {
 			yield* sameMessage(input.message, input.messageId);
 			/*
@@ -122,11 +216,59 @@ export const layer = Layer.effectDiscard(
 				.finalizeAssistant({
 					sessionId: input.sessionId,
 					entryId: input.messageId,
+					state: input.state,
 					data: encoded.data,
 					parts: encoded.parts,
 				})
 				.pipe(Effect.orDie);
+
+			/*
+			 * Settle the calls this terminal will never run, here, in the transaction
+			 * that settles the entry.
+			 *
+			 * The loop used to do this afterwards, publishing one event per call, so
+			 * a crash between the terminal and its own policy left an entry marked
+			 * settled with calls still open. Deciding it once, where the reason is
+			 * already in hand, makes the whole turn's settlement atomic — and takes
+			 * the reason switch out of the loop, which now only has to run whatever
+			 * is still pending.
+			 *
+			 * `toolUse` and `stop` settle nothing: their calls are the loop's to run.
+			 * A `stop` carrying calls is a provider contradiction, and the concrete
+			 * tool lifecycle is the authoritative one.
+			 */
+			const disposition = unrunnable[input.reason];
+			if (disposition !== undefined) {
+				yield* settleOpenCalls({
+					sessionId: input.sessionId,
+					messageId: input.messageId,
+					...disposition,
+				});
+			}
 		});
+
+		/**
+		 * Where a terminal leaves the entry.
+		 *
+		 * A turn is one assistant response *plus its tool calls and results*, so a
+		 * response that hands calls to the loop has not finished the turn — the
+		 * entry stays `draft` and `TurnEnded` commits it once every call is
+		 * terminal. Anything else is settled here: a failure never runs its calls,
+		 * and a truncated response has just had them settled above.
+		 *
+		 * Calling a `toolUse` entry `committed` was the earlier behaviour and it was
+		 * a false claim — it also made the recovery sweep, which looks for drafts,
+		 * blind to a kill landing between the terminal and the batch.
+		 */
+		const settledState = (
+			message: Message.AssistantMessage,
+			reason: Message.AssistantMessage["stopReason"],
+		): Session.EntryState => {
+			if (reason === "aborted") return "aborted";
+			if (reason === "error") return "error";
+			if (unrunnable[reason] !== undefined) return "committed";
+			return message.parts.some((part) => part.type === "toolCall") ? "draft" : "committed";
+		};
 
 		/**
 		 * One completed block, written into the slot aikit assigned it.
@@ -254,12 +396,15 @@ export const layer = Layer.effectDiscard(
 		);
 
 		yield* events.project(EventList.LLMEnded, (event) =>
+			// `stop`, `length`, and `toolUse` all settle the entry the same way; how
+			// it ended stays in the envelope's `stopReason`.
 			finalizeAssistant({
 				sessionId: event.data.sessionId,
 				messageId: event.data.messageId,
 				message: event.data.message,
 				reason: event.data.reason,
-			}),
+				state: settledState(event.data.message, event.data.reason),
+			}).pipe(Effect.orDie),
 		);
 
 		yield* events.project(EventList.LLMFailed, (event) =>
@@ -268,7 +413,8 @@ export const layer = Layer.effectDiscard(
 				messageId: event.data.messageId,
 				message: event.data.message,
 				reason: event.data.reason,
-			}),
+				state: settledState(event.data.message, event.data.reason),
+			}).pipe(Effect.orDie),
 		);
 
 		/*
@@ -323,43 +469,103 @@ export const layer = Layer.effectDiscard(
 		 * event's whole claim is that nothing produced a part for it. Its identity
 		 * and arguments already live in the row.
 		 */
-		yield* events.project(EventList.ToolFailed, (event) =>
-			Effect.gen(function* () {
-				const rows = yield* sessions.toolCalls(event.data.messageId);
-				const row = rows.find((candidate) => Option.getOrUndefined(candidate.callId) === event.data.callId);
-				if (row === undefined) {
-					return yield* Effect.die(
-						`ToolFailed names call "${event.data.callId}", which entry ${event.data.messageId} does not have`,
-					);
-				}
-				const base = yield* ContextCodec.decodeToolCallBase(row);
-				/*
-				 * A tool that was interrupted mid-run usually produced something first,
-				 * and that output is more useful to the model than the reason it
-				 * stopped. Keep both: the partial when there is one, the reason always.
-				 */
-				const reported = event.data.partial?.partial?.content ?? [];
-				const settled: Message.ToolCallTerminalPart = {
-					...base,
-					status: event.data.status,
-					result: {
-						content: [...reported, { type: "text", text: event.data.error }],
-						isError: true,
-					},
-				};
-				const encoded = yield* ContextCodec.encodePart({
-					messageId: event.data.messageId,
-					role: "assistant",
-					part: settled,
-				});
-				yield* sessions.settleToolCall({
+		/*
+		 * The turn is over: the response is written and every call it made is
+		 * terminal. This is the only thing that commits an entry a terminal left
+		 * draft, which is what makes "committed" mean the whole turn rather than
+		 * just the provider's half of it.
+		 *
+		 * Nothing to do for a turn whose terminal already settled the entry — a
+		 * failure, or a response with no calls — so an already-settled entry is not
+		 * an error. An entry that does not exist at all is.
+		 */
+		yield* events.project(EventList.TurnEnded, (event) =>
+			sessions
+				.closeDraft({
 					sessionId: event.data.sessionId,
 					entryId: event.data.messageId,
-					callId: event.data.callId,
-					toolName: event.data.toolName,
-					status: event.data.status,
-					data: encoded.data,
+					state: "committed",
+				})
+				// `false` is ordinary — a terminal that left no tool work settled the
+				// entry itself. A *missing* entry is not, and dies rather than being
+				// swallowed by the same ignore.
+				.pipe(Effect.asVoid, Effect.orDie),
+		);
+
+		/*
+		 * Tell the model, not just the log.
+		 *
+		 * A synthetic entry decodes into a user message and lands in the next
+		 * request's context, which is the only way the model can learn the exchange
+		 * was cut short — nothing about a halt reaches a provider otherwise. Same
+		 * reasoning as the truncated-tool-call wording above.
+		 */
+		yield* events.project(EventList.ExchangeHalted, (event) =>
+			Effect.gen(function* () {
+				if (event.durable === undefined) return yield* Effect.die("ExchangeHalted is missing its sequence");
+				const text = `Stopped after ${event.data.continuations} consecutive turns without user input. Ask again to continue.`;
+				const data = yield* encodeHaltData({
+					messageId: event.data.entryId,
+					customType: "exchange-halted",
+					display: true,
 				});
+				const part = yield* ContextCodec.encodePart({
+					messageId: event.data.entryId,
+					role: "user",
+					part: { type: "text", text },
+				});
+				yield* sessions.append({
+					id: event.data.entryId,
+					sessionId: event.data.sessionId,
+					seq: event.durable.seq,
+					type: "synthetic",
+					data,
+					parts: [part],
+				});
+			}).pipe(Effect.orDie),
+		);
+
+		/*
+		 * A turn that stopped without finishing: settle what it left open, then
+		 * close the entry the way the turn would have.
+		 *
+		 * Which way is the same question the recovery sweep answers, and `state` is
+		 * what makes it answerable — a draft still carrying `stopReason: "aborted"`
+		 * never received a terminal, because an aborted terminal settles the entry
+		 * rather than leaving it draft. Anything else means the response completed
+		 * and only its tools were cut short.
+		 *
+		 * No draft means the failure happened before an entry existed, or a terminal
+		 * already settled it. Both are ordinary, and both are nothing to do.
+		 */
+		yield* events.project(EventList.TurnFailed, (event) =>
+			Effect.gen(function* () {
+				const draft = yield* sessions.latestDraft(event.data.sessionId);
+				if (Option.isNone(draft)) return;
+				const messageId = SessionMessageSchema.ID.from(draft.value.entry.id);
+				yield* settleOpenCalls({
+					sessionId: event.data.sessionId,
+					messageId,
+					status: "aborted",
+					error: `Tool call was not executed: the turn failed (${event.data.reason}).`,
+				});
+				const envelope = yield* ContextCodec.decodeMessage(draft.value);
+				yield* sessions.closeDraft({
+					sessionId: event.data.sessionId,
+					entryId: messageId,
+					state: envelope.role === "assistant" && envelope.stopReason !== "aborted" ? "committed" : "aborted",
+				});
+			}).pipe(Effect.orDie),
+		);
+
+		yield* events.project(EventList.ToolFailed, (event) =>
+			settleOpenCalls({
+				sessionId: event.data.sessionId,
+				messageId: event.data.messageId,
+				callId: event.data.callId,
+				status: event.data.status,
+				error: event.data.error,
+				...(event.data.partial === undefined ? {} : { partial: event.data.partial }),
 			}).pipe(Effect.orDie),
 		);
 	}),

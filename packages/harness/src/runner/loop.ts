@@ -25,7 +25,7 @@
  */
 
 import type { Message } from "@codeworksh/aikit";
-import { DateTime, Effect, Exit, Layer, Option } from "effect";
+import { Cause, DateTime, Effect, Exit, Layer, Option } from "effect";
 import { ContextCodec } from "../context/codec.ts";
 import { Context } from "../context/context.ts";
 import { Event } from "../event/event.ts";
@@ -114,44 +114,6 @@ export const layer = (options: Options = {}) =>
 			}
 
 			/**
-			 * Why a turn stopped with calls still open. Each answers the settlement
-			 * question differently, and none of them re-executes anything.
-			 */
-			type Ending = "interrupted" | "truncated" | "aborted" | "failed";
-
-			/**
-			 * How one open call settles, given what ended the turn.
-			 *
-			 * The interrupted case is the only one that reads the prior status,
-			 * because it is the only one where the prior status carries information:
-			 * a live process watched these calls, so it knows which had started. The
-			 * others describe something that happened to the whole response.
-			 */
-			const settlement = (ending: Ending, prior: "pending" | "running") => {
-				switch (ending) {
-					case "interrupted":
-						return prior === "pending"
-							? ({
-									status: "skipped",
-									error: "Tool call was never executed: the session ended before it started.",
-								} as const)
-							: ({
-									status: "aborted",
-									error: "Tool execution was interrupted: the session ended while it was running.",
-								} as const);
-					case "truncated":
-						return {
-							status: "skipped",
-							error: "Tool call was not executed: the response hit its output limit, so the arguments may be incomplete.",
-						} as const;
-					case "aborted":
-						return { status: "aborted", error: "Tool call was not executed: the response was aborted." } as const;
-					case "failed":
-						return { status: "error", error: "Tool call was not executed: the response failed." } as const;
-				}
-			};
-
-			/**
 			 * Settle calls that never produced an executor outcome.
 			 *
 			 * Shared by the two places that need it — the drain-start sweep and
@@ -164,12 +126,13 @@ export const layer = (options: Options = {}) =>
 				readonly sessionId: SessionSchema.ID;
 				readonly messageId: SessionMessageSchema.ID;
 				readonly calls: ReadonlyArray<Unresolved>;
-				readonly ending: Ending;
 				/** Last progress per call, when this process was the one watching. */
 				readonly partials?: ReadonlyMap<string, Message.ToolCallRunningPart>;
 			}) {
 				for (const call of input.calls) {
-					const { status, error } = settlement(input.ending, call.status);
+					// What the prior status proves, and nothing more. `pending` was never
+					// started; `running` may already have written to disk.
+					const skipped = call.status === "pending";
 					const partial = input.partials?.get(call.callId);
 					yield* events.publish(EventList.ToolFailed, {
 						sessionId: input.sessionId,
@@ -178,22 +141,13 @@ export const layer = (options: Options = {}) =>
 						partIndex: call.partIndex,
 						callId: call.callId,
 						toolName: call.toolName,
-						status,
-						error,
+						status: skipped ? "skipped" : "aborted",
+						error: skipped
+							? "Tool call was never executed: the session ended before it started."
+							: "Tool execution was interrupted: the session ended while it was running.",
 						...(partial === undefined ? {} : { partial }),
 					});
 				}
-			});
-
-			/** Settle every open call on one entry. Returns how many there were. */
-			const closeOpenCalls = Effect.fn("Loop.closeOpenCalls")(function* (input: {
-				readonly sessionId: SessionSchema.ID;
-				readonly messageId: SessionMessageSchema.ID;
-				readonly ending: Ending;
-			}) {
-				const calls = yield* unresolvedCalls(input.messageId);
-				yield* failCalls({ ...input, calls });
-				return calls.length;
 			});
 
 			/** Unresolved calls on one entry, straight from the promoted columns. */
@@ -346,7 +300,6 @@ export const layer = (options: Options = {}) =>
 											sessionId: snapshot.sessionId,
 											messageId,
 											calls: unresolved,
-											ending: "interrupted",
 											partials,
 										}),
 									),
@@ -382,15 +335,27 @@ export const layer = (options: Options = {}) =>
 			 * at-least-once execution for a mutating tool.
 			 */
 			const failInterruptedTools = Effect.fn("Loop.failInterruptedTools")(function* (sessionId: SessionSchema.ID) {
-				const found = yield* context.latestAssistant(sessionId);
+				const found = yield* context.currentDraft(sessionId);
 				if (Option.isNone(found)) return;
 				const messageId = SessionMessageSchema.ID.from(found.value.messageId);
-				yield* failCalls({
-					sessionId,
-					messageId,
-					ending: "interrupted",
-					calls: yield* unresolvedCalls(messageId),
-				});
+				yield* failCalls({ sessionId, messageId, calls: yield* unresolvedCalls(messageId) });
+				/*
+				 * Close it, as the turn itself would have.
+				 *
+				 * Which way depends on how far the turn got, and `state` is what make
+				 * that answerable: a draft whose envelope still says `aborted` never
+				 * received a terminal at all, because an aborted terminal settles the
+				 * entry rather than leaving it draft. Anything else means the response
+				 * completed and only its tools were cut short — that turn earned its
+				 * commit.
+				 */
+				yield* sessions
+					.closeDraft({
+						sessionId,
+						entryId: messageId,
+						state: found.value.stopReason === "aborted" ? "aborted" : "committed",
+					})
+					.pipe(Effect.asVoid, Effect.orDie);
 			});
 
 			const runTurnAttempt = Effect.fn("Loop.runTurnAttempt")(function* (snapshot: State.Snapshot) {
@@ -436,17 +401,18 @@ export const layer = (options: Options = {}) =>
 				const messageId = SessionMessageSchema.ID.from(terminal.message.messageId);
 
 				/*
-				 * A response that failed still leaves its calls open, and leaving them
-				 * for the next drain would mean the model is told nothing about them
-				 * until it asks again. Settle here, saying which happened: aborted is
-				 * something we did, error is something the provider did.
+				 * The terminal's own projection has already settled every call this
+				 * response will never run — a truncated one's arguments cannot be
+				 * trusted, a failed one's calls never got a chance — in the same
+				 * transaction that settled the entry. So whatever is still pending here
+				 * is, by construction, exactly what should execute, and the loop does
+				 * not need to know why the turn ended to decide that.
+				 *
+				 * That is what used to be a five-way switch. It also dissolves the
+				 * question of whether a `stop` carrying tool calls should run them:
+				 * nothing settled them, so they run.
 				 */
 				if (terminal.outcome === "failed") {
-					yield* closeOpenCalls({
-						sessionId,
-						messageId,
-						ending: terminal.reason === "aborted" ? "aborted" : "failed",
-					});
 					return yield* new Runner.ProviderTurnError({
 						provider,
 						model,
@@ -454,53 +420,47 @@ export const layer = (options: Options = {}) =>
 					});
 				}
 
+				const ran = yield* runToolBatch(snapshot, messageId);
 				/*
-				 * What the terminal says the response was, and what to do about the
-				 * calls it left behind. The batch always runs after the terminal is
-				 * durable, so the array is complete before a single handler is invoked.
+				 * A truncated response continues even though nothing ran. Its calls were
+				 * settled with an instruction to re-issue them, and that instruction is
+				 * only worth writing if the model gets another turn to act on it —
+				 * otherwise the exchange ends with dead calls and no answer.
 				 */
-				switch (terminal.reason) {
-					case "toolUse": {
-						const ran = yield* runToolBatch(snapshot, messageId);
-						if (!ran) {
-							// The provider said it wanted tools and named none. Nothing to
-							// execute and nothing to continue on, so continuing would spin —
-							// this is a broken stream, not an empty turn.
-							return yield* new Runner.LLMStreamError({
-								sessionId,
-								reason: `terminal reason "toolUse" but the response has no tool calls`,
-							});
-						}
-						return { messageId, reason: terminal.reason, needsContinuation: true };
-					}
-
-					case "length": {
-						/*
-						 * The output was cut off mid-generation, so every call in it may
-						 * carry truncated arguments — arguments that can still parse and
-						 * validate while meaning something else entirely. None are safe to
-						 * run, and the model is told so rather than left guessing.
-						 */
-						yield* closeOpenCalls({ sessionId, messageId, ending: "truncated" });
-						return { messageId, reason: terminal.reason, needsContinuation: false };
-					}
-
-					case "stop": {
-						/*
-						 * A `stop` carrying tool calls is a provider contradiction. The
-						 * calls are durable and canonical, so the concrete tool lifecycle
-						 * is the authoritative one: run them and record the disagreement,
-						 * rather than stranding a request the model plainly made.
-						 */
-						const ran = yield* runToolBatch(snapshot, messageId);
-						if (ran) {
-							yield* Effect.logWarning("loop: provider finished with stop but requested tools").pipe(
-								Effect.annotateLogs({ sessionId, messageId }),
-							);
-						}
-						return { messageId, reason: terminal.reason, needsContinuation: ran };
-					}
+				if (terminal.reason === "length") {
+					return { messageId, reason: terminal.reason, needsContinuation: true };
 				}
+				if (terminal.reason === "toolUse" && !ran) {
+					// The provider said it wanted tools and named none. Nothing to run
+					// and nothing to continue on, so continuing would spin.
+					return yield* new Runner.LLMStreamError({
+						sessionId,
+						reason: `terminal reason "toolUse" but the response has no tool calls`,
+					});
+				}
+				return { messageId, reason: terminal.reason, needsContinuation: ran };
+			});
+
+			/**
+			 * Stop an exchange the model will not stop on its own.
+			 *
+			 * Ends the drain normally rather than failing it: a policy limit tripping
+			 * is the limit working, and a failure here would read as a defect in every
+			 * log and alert that saw it. The durable record and the synthetic entry
+			 * are what make the stop legible — to a reader of the log, and to the model
+			 * on the next prompt, which would otherwise see a long chain of turns and
+			 * no sign that it was cut off.
+			 */
+			const halt = Effect.fn("Loop.halt")(function* (snapshot: State.Snapshot, continuations: number) {
+				yield* Effect.logWarning("loop: exchange halted at the continuation limit").pipe(
+					Effect.annotateLogs({ sessionId: snapshot.sessionId, continuations }),
+				);
+				yield* events.publish(EventList.ExchangeHalted, {
+					sessionId: snapshot.sessionId,
+					timestamp: yield* DateTime.now,
+					entryId: SessionMessageSchema.ID.create(),
+					continuations,
+				});
 			});
 
 			const runTurn = Effect.fn("Loop.runTurn")(function* (
@@ -528,7 +488,41 @@ export const layer = (options: Options = {}) =>
 				);
 				yield* events.publish(EventList.TurnStarted, { sessionId, timestamp: yield* DateTime.now, turn });
 
-				const result = yield* runTurnAttempt(snapshot);
+				/*
+				 * A turn that stops without finishing still has to close.
+				 *
+				 * `TurnEnded` is what commits an entry the terminal deliberately left
+				 * `draft`, so stopping between the two left it unfinished until the next
+				 * drain's sweep found it — making an interrupt depend on the path meant
+				 * for hard kills.
+				 *
+				 * Interruption is what this is for, not tool failure. A tool that errors
+				 * or aborts settles as a terminal part with `isError`, which the model
+				 * reads; only a `failureMode: "error"` tool propagates, and none exists.
+				 * What remains is a stop landing mid-batch, plus corruption edges.
+				 *
+				 * The close is a finalizer because that is the only thing that runs
+				 * while a fiber unwinds.
+				 */
+				const result = yield* runTurnAttempt(snapshot).pipe(
+					Effect.onExit((exit) =>
+						Exit.isSuccess(exit)
+							? Effect.void
+							: DateTime.now.pipe(
+									Effect.flatMap((timestamp) =>
+										events.publish(EventList.TurnFailed, {
+											sessionId,
+											timestamp,
+											turn,
+											// An interrupted exit *is* a failure exit, so the cause has
+											// to be asked what kind it was rather than the exit.
+											reason: Cause.hasInterrupts(exit.cause) ? "interrupted" : Cause.pretty(exit.cause),
+										}),
+									),
+									Effect.orDie,
+								),
+					),
+				);
 
 				yield* events.publish(EventList.TurnEnded, {
 					sessionId,
@@ -574,6 +568,12 @@ export const layer = (options: Options = {}) =>
 					 */
 					const snapshot = yield* state.snapshot(input.sessionId);
 					let turn = 0;
+					/*
+					 * Consecutive turns the *model* asked for. Not the same as `turn`,
+					 * which counts every turn in the exchange: a user steering fifty times
+					 * is driving, not looping, and bounding that would cut them off.
+					 */
+					let continuations = 0;
 					let needsContinuation = true;
 					while (needsContinuation) {
 						const result = yield* runTurn(snapshot, turn + 1, admission);
@@ -581,9 +581,15 @@ export const layer = (options: Options = {}) =>
 						// a continuation is true when we have toolcalls that needs resolving
 						// i.e tools were executed; now we need to feed them back
 						needsContinuation = result.needsContinuation;
+						continuations = needsContinuation ? continuations + 1 : 0;
 						// else re-run if any steering messages are pending
 						if (!needsContinuation) {
+							// User input resets the leash rather than spending it.
 							needsContinuation = yield* inputs.hasPending(input.sessionId, "steer");
+						}
+						if (needsContinuation && continuations >= snapshot.maxContinuations) {
+							yield* halt(snapshot, continuations);
+							break;
 						}
 						// Inside a continuation the turn is already justified. A steer that
 						// arrived mid-turn joins the next request; its absence does not

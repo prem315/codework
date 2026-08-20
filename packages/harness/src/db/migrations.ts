@@ -151,6 +151,13 @@ export const migrations = {
 				parent_id TEXT,
 				seq INTEGER NOT NULL,
 				type TEXT NOT NULL,
+				-- Settlement state: 'draft' | 'committed' | 'aborted' | 'error'.
+				-- Only an assistant assembled from a live stream is ever 'draft';
+				-- every other entry type is committed the moment it is appended.
+				-- Deliberately not called "status": session_entry_part.status holds
+				-- aikit's tool status, which shares 'aborted' and 'error' with this
+				-- column and means something else by them.
+				state TEXT NOT NULL DEFAULT 'committed',
 				data TEXT NOT NULL,
 				label TEXT,
 				metadata TEXT,
@@ -163,6 +170,9 @@ export const migrations = {
 		// Parent key for the composite FKs (SQLite requires a UNIQUE covering
 		// the referenced columns).
 		yield* sql`CREATE UNIQUE INDEX session_entry_session_id_idx ON session_entry (session_id, id)`;
+		// The recovery sweep asks one question per drain -- "is a turn unfinished
+		// here?" -- and this is what keeps it a lookup rather than a scan.
+		yield* sql`CREATE INDEX session_entry_state_idx ON session_entry (session_id, state)`;
 
 		yield* sql`
 			CREATE TABLE session_entry_part (

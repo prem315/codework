@@ -77,6 +77,19 @@ export interface Options extends RequestOptions {
 	readonly model?: string;
 	readonly thinkingLevel?: Model.ThinkingLevel;
 	readonly toolExecution?: ToolExecutionMode;
+	/**
+	 * How many turns in a row the *model* may demand before the exchange stops.
+	 *
+	 * Bounds a runaway: a model that keeps calling tools, or keeps overrunning
+	 * its output limit, otherwise holds the mount and the session lock forever.
+	 * Deliberately not a cost or time budget — a model looping on cheap calls
+	 * burns turns and almost no money, so a spend ceiling never trips on the
+	 * runaway it is meant to catch.
+	 *
+	 * Counts consecutive continuations the model asked for. User input resets it:
+	 * someone steering fifty times is driving, not looping.
+	 */
+	readonly maxContinuations?: number;
 }
 
 /**
@@ -90,6 +103,10 @@ export const defaults = {
 	model: "gpt-5.5",
 	thinkingLevel: "medium",
 	toolExecution: "sequential",
+	// A guess, not a derived number: a serious refactor can legitimately take
+	// 30-50 tool rounds, so much lower cuts off real work and much higher stops
+	// being a safety net.
+	maxContinuations: 64,
 	timeoutMs: 60_000,
 	maxRetries: 0,
 } as const satisfies {
@@ -97,6 +114,7 @@ export const defaults = {
 	readonly model: string;
 	readonly thinkingLevel: Model.ThinkingLevel;
 	readonly toolExecution: ToolExecutionMode;
+	readonly maxContinuations: number;
 	readonly timeoutMs: number;
 	readonly maxRetries: number;
 };
@@ -136,6 +154,7 @@ export interface Snapshot {
 	readonly thinkingLevel: Model.ThinkingLevel;
 	readonly request: RequestOptions;
 	readonly toolExecution: ToolExecutionMode;
+	readonly maxContinuations: number;
 }
 
 export interface Interface {
@@ -182,6 +201,7 @@ export const layer = (options: Options = {}) => {
 		model = defaults.model,
 		thinkingLevel = defaults.thinkingLevel,
 		toolExecution = defaults.toolExecution,
+		maxContinuations = defaults.maxContinuations,
 		...rest
 	} = options;
 
@@ -250,6 +270,7 @@ export const layer = (options: Options = {}) => {
 					thinkingLevel,
 					request,
 					toolExecution,
+					maxContinuations,
 				} satisfies Snapshot;
 			}),
 		}),
